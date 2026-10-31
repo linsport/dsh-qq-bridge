@@ -217,6 +217,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     getRoleInlineMaxChars() { return roleInlineMaxChars; },
     setRoleInlineMaxChars(value) { roleInlineMaxChars = value; },
     settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
+    // 伪调用没发出去时，提醒要带交接数据（想调什么 / 还没读几 / 水位推到哪）。
+    // 单独导出是为了能只断言文案本身，不去跑整个 turn/end。
+    describePseudoHandoffV2,
     getMode() { return currentMode; },
     setSelfIdentity(display, id) {
       selfDisplayName = String(display ?? '');

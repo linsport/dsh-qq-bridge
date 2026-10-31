@@ -33,7 +33,7 @@ const GROUP = 'group:456'; // harness 默认 allow.groups 是 456
 const h = await bridgeHarness({ config: { socialV2: {
   proactive: { enabled: false },
   sticker: { enabled: false },
-  wake: { postReplyWatchMs: 120000 }
+  wake: { postReplyWatchMs: 180000 }
 } } });
 h.setMode('reserved2');
 h.setSelfIdentity('大肥鱼', SELF);
@@ -117,7 +117,8 @@ await test('她一小时前说过话，现在别人的追问不算她', () => {
 });
 
 // 造一段「她刚回完某人的话」的最近记录：run() 里放 [对方一句, 她一句]。
-// watchConversationPartner 就是从这里认出「刚才跟她聊的是谁」的。
+// 认人判据已经放宽（见 evaluateWakeTriggerV2 的 watch 分支），这里不再用它做断言，
+// 但 armWatchWindowV2 要看 lastAiReplyAt，留着这份记录让用例贴近真实状态。
 function withPartner(st, partnerId = OTHER, partnerName = '丁群友') {
   st.recentMessages = [
     { seq: 1, messageId: '900', sender: partnerName, userId: partnerId, text: '你先说', plain: '你先说', isSelf: false, time: Date.now() - 20000 },
@@ -127,7 +128,7 @@ function withPartner(st, partnerId = OTHER, partnerName = '丁群友') {
   return st;
 }
 
-await test('观望窗口：刚才跟她聊的那个人接着说，能把她叫回来', () => {
+await test('观望窗口：她刚回完的那个人接着说，能把她叫回来', () => {
   const st = triggerOnly();
   // 关掉 question，只剩观望窗口这一条路，避免两条规则互相掩护。
   st.wakeConfig.triggers.question = false;
@@ -138,25 +139,92 @@ await test('观望窗口：刚才跟她聊的那个人接着说，能把她叫�
   assert.equal(h.evaluateWakeTriggerV2(GROUP, st, eventFor(text), 'group', text, text, false), 'watch');
 });
 
-await test('观望窗口：窗口内换了个人闲聊，不再把她叫醒（2026-10-31 审查的滚雪球）', () => {
+await test('观望窗口：换个群友接同一个梗也叫得醒她（2026-10-31 晚漏接那条）', () => {
   const st = triggerOnly();
   st.wakeConfig.triggers.question = false;
-  withPartner(st);
-  assert.ok(h.armWatchWindowV2(st, GROUP) > Date.now());
-  // 另一个群友插一句完全无关的话 —— 以前只要有人说话就 return 'watch'。
-  const text = '今天好热';
-  const ev = eventFor(text, { user_id: '888888', sender: { nickname: '路人甲' } });
-  assert.equal(h.evaluateWakeTriggerV2(GROUP, st, ev, 'group', text, text, false), null);
+  withPartner(st, '2914515726', '乙群友');
+  const until = h.armWatchWindowV2(st, GROUP);
+  assert.ok(until > Date.now());
+  // 她刚才回的是「乙群友」，紧接着「甲群友」接同一个梗。
+  // 旧判据只认最后回复的那一个人，于是把该接的话放过去了（实测漏接那条）。
+  const text = '那前面那个又是谁';
+  const ev = eventFor(text, { user_id: '1326818385', sender: { nickname: '甲群友' } });
+  assert.equal(h.evaluateWakeTriggerV2(GROUP, st, ev, 'group', text, text, false), 'watch');
 });
 
-await test('观望窗口：同一个对话段只开一次，收尾再收尾也不会续命', () => {
+await test('观望窗口：她自己又说了一句 → 倒计时重置回满', () => {
+  const st = triggerOnly();
+  withPartner(st);
+  const ms = h.postReplyWatchMs();
+  const first = h.armWatchWindowV2(st, GROUP);
+  assert.ok(first > Date.now());
+  // 模拟「收尾后已经过了 100 秒，这会儿她又开口了」：把截止时刻往回拨。
+  st.watchUntil = first - 100000;
+  st.watchOpenedAt = Date.now();
+  const rolled = Number(st.watchUntil);
+  h.recordSentMessagesV2(GROUP, ['我再补一句']);
+  const after = Number(h.getSocialV2State(GROUP).watchUntil);
+  assert.ok(after > rolled, `倒计时应该被重置回来，rolled=${rolled} after=${after}`);
+  assert.ok(after >= Date.now() + ms - 200, `应该重置回满 ${ms} 毫秒，实际只剩 ${after - Date.now()}`);
+  assert.ok(after <= Date.now() + ms + 200, `不该比一整段还长（那是累加），实际 ${after - Date.now()}`);
+});
+
+await test('观望窗口：窗口还开着时再收尾不续命（她没开口就不该加时）', () => {
   const st = triggerOnly();
   withPartner(st);
   const first = h.armWatchWindowV2(st, GROUP);
-  assert.ok(first > Date.now());
-  // 模拟「她这轮又被 watch 叫醒、又说了话、又收尾」—— 以前这里会无条件把截止时间往后推。
+  // 模拟「已经过了 100 秒，她一句话没说，这一轮又收尾了」。
+  st.watchUntil = first - 100000;
+  const rolled = Number(st.watchUntil);
   const second = h.armWatchWindowV2(st, GROUP);
-  assert.equal(second, first, '同一个对话段不该把截止时刻往后推');
+  // 2026-10-31 22:55 实测：收尾 60 秒 → 她又收尾 → 又变回 60 秒，一路续到 22:57。
+  // 收尾只负责开窗，续窗只能靠她自己发消息。
+  assert.equal(second, rolled, `收尾不该把倒计时续回去，rolled=${rolled} second=${second}`);
+});
+
+await test('观望窗口：别人说话不重置倒计时（她没接，时间该继续走）', () => {
+  const st = triggerOnly();
+  withPartner(st);
+  const first = h.armWatchWindowV2(st, GROUP);
+  st.watchUntil = first - 100000;
+  st.watchOpenedAt = Date.now();
+  const rolled = Number(st.watchUntil);
+  h.appendSocialV2Message(GROUP, '甲群友', '他们还在聊', '他们还在聊', false, false, null, [], '1326818385');
+  assert.equal(Number(h.getSocialV2State(GROUP).watchUntil), rolled, '别人刷屏不该给她续观望');
+});
+
+await test('观望窗口：窗口没开的会话，她说话也不会凭空开出一段观望', () => {
+  const st = triggerOnly();
+  st.watchUntil = 0;
+  h.recordSentMessagesV2(GROUP, ['随口一句']);
+  assert.equal(Number(h.getSocialV2State(GROUP).watchUntil), 0, '没在观望就不该被开出来');
+});
+
+await test('观望窗口：连续续命也有总时长上限，不会守着不放', () => {
+  const st = triggerOnly();
+  withPartner(st);
+  const ms = h.postReplyWatchMs();
+  const start = Date.now();
+  let until = h.armWatchWindowV2(st, GROUP);
+  assert.ok(until > start);
+  // 一直收尾，每次都想往后延 —— 总时长必须收敛在 30 分钟以内。
+  for (let i = 0; i < 40; i += 1) {
+    until = h.armWatchWindowV2(st, GROUP);
+  }
+  const total = until - Number(st.watchOpenedAt);
+  assert.ok(total <= 30 * 60 * 1000 + ms, `总时长该封顶在 30 分钟，实际 ${Math.round(total / 1000)} 秒`);
+});
+
+await test('观望窗口：窗口过期之后再收尾，重新从当前时刻起算', () => {
+  const st = triggerOnly();
+  withPartner(st);
+  h.armWatchWindowV2(st, GROUP);
+  // 窗口已经过去了（模拟群里安静了一阵）。
+  st.watchUntil = Date.now() - 1000;
+  const now = Date.now();
+  const again = h.armWatchWindowV2(st, GROUP);
+  assert.ok(again >= now + h.postReplyWatchMs() - 5, '过期后应当重新起算，而不是停在旧值');
+  assert.ok(Number(st.watchOpenedAt) >= now - 5, 'watchOpenedAt 也要跟着重置');
 });
 
 await test('观望窗口：私聊不开（私聊每条消息本来就会叫醒她）', () => {
@@ -222,8 +290,8 @@ await test('老 config.json 的 wake 段缺新键时，深度合并仍给出默�
   try {
     legacy.setMode('reserved2');
     legacy.setSelfIdentity('大肥鱼', SELF);
-    assert.equal(legacy.cfg.socialV2.wake.postReplyWatchMs, 120000,
-      '缺键必须回落到默认 120000，否则观望窗口永远不生效');
+    assert.equal(legacy.cfg.socialV2.wake.postReplyWatchMs, 180000,
+      '缺键必须回落到默认 180000，否则观望窗口永远不生效');
     // 老配置里显式写了的值也不能被默认值盖掉
     assert.equal(legacy.cfg.socialV2.wake.batchWindowMs, 3000);
     assert.equal(legacy.cfg.socialV2.wake.sleepMinMs, 30000);
@@ -235,7 +303,7 @@ await test('老 config.json 的 wake 段缺新键时，深度合并仍给出默�
   }
 });
 
-await test('write 段里显式写 0 的观望窗口不会被默认值顶回 120000', async () => {
+await test('write 段里显式写 0 的观望窗口不会被默认值顶回 180000', async () => {
   const zeroed = await bridgeHarness({
     config: { socialV2: { wake: { postReplyWatchMs: 0 } } },
   });

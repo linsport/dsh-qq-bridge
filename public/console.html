@@ -3794,7 +3794,7 @@ document.getElementById('v2QzonePrompt').addEventListener('input', updateQzonePr
 
 // 「醒来先过三关」的内置文案。和后端 WAKE_CHECK_DEFAULT_PROMPT 必须是同一份 ——
 // 「填回内置默认」按钮写回去的就是它，两边差一个字，操作者点一下就会发现内容变了。
-const WAKE_CHECK_DEFAULT_PROMPT = "【醒来先过三关】① 看时间：每条都带「多久前」，看**最新那条和叫你的那条**一起判 —— 超 120 分钟默认不接（除非明确点你、且答了现在还有用），超 10 分钟别用「刚」「哈哈哈刚看到」这种实时语气；② 看对象：只有（@你）或引用了你的消息才算叫你，（未点名）（@别人）是他们在聊，里面的「你」不是你；③ 看话头：你要接的这句是不是已经有人答了、话题是不是后面已经翻篇 —— 答过了别重答，翻篇了就接新的或干脆不说，不用硬找话。";
+const WAKE_CHECK_DEFAULT_PROMPT = "【醒来先过三关】① 看时间：每条都带「多久前」，看**最新那条和叫你的那条**一起判 —— 超 120 分钟默认不接（除非明确点你、且答了现在还有用），超 10 分钟别用「刚」「哈哈哈刚看到」这种实时语气；② 看对象：`（@你）`、引用了你的消息、上文正说到你和主人 —— 这几种多半在问你；`（@别人）`、`（没@人）` 只说明没有 at，不代表不关你事，结合前后自己判断。**接话之前先把这一段读懂**：他们在聊什么、上一条是谁在接谁的话题、中间有没有人插进来。读懂了，这句在接谁自然就清楚，不用靠数标记。判断错了就当场改口，这很正常；③ 看话头：你要接的这句是不是已经有人答了、话题是不是后面已经翻篇 —— 答过了别重答，翻篇了就接新的或干脆不说，不用硬找话。";
 
 function updateWakeCheckCount() {
   const el = document.getElementById('v2WakeCheckPrompt');
@@ -3841,7 +3841,7 @@ async function loadV2Config() {
     document.getElementById('v2BatchWindowMsPrivate').value = w.batchWindowMsPrivate ?? 0;
     document.getElementById('v2NoActionLimit').value = w.noActionLimit ?? 3;
     document.getElementById('v2MaxWakeConfigReminders').value = w.maxWakeConfigReminders ?? 2;
-    document.getElementById('v2PostReplyWatchMs').value = Math.round((w.postReplyWatchMs ?? 120000) / 1000);
+    document.getElementById('v2PostReplyWatchMs').value = Math.round((w.postReplyWatchMs ?? 180000) / 1000);
     document.getElementById('v2PreSleepWaitEnabled').checked = w.preSleepWaitEnabled !== false;
     const s = c.send || {};
     document.getElementById('v2BurstEnabled').checked = s.burstEnabled !== false;

@@ -1,6 +1,6 @@
 # 文档索引（docs/README.md）
 
-> 根目录只留 `README.md` / `README.en.md` / `RULES.md` 三个文档，其余全部在本目录下。
+> 根目录只留 `README.md` / `RULES.md` 两个文档，其余全部在本目录下。
 > 仓库目录结构与 `scripts/` 命名约定见 **[FOLDER_MAP.md](FOLDER_MAP.md)**。
 >
 > **状态标记**：✅ 仍然有效（按它做就对） · ⚠️ 部分过时（见备注） · 🗄️ 已被取代（保留作背景）

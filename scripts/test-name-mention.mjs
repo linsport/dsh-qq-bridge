@@ -39,7 +39,7 @@ await test('hasNameMention：独立出现、被标点包住时算', () => {
   assert.equal(h.hasNameMention('鲸鱼，你在吗', '鲸鱼'), true);
   assert.equal(h.hasNameMention('鲸鱼', '鲸鱼'), true);
   assert.equal(h.hasNameMention('大肥鱼：你醒了吗', '大肥鱼'), true);
-  // 「叫大肥鱼的人真多」是在谈论这个名字，不是在叫它 —— 前后都贴着汉字，按未点名处理。
+  // 「叫大肥鱼的人真多」是在谈论这个名字，不是在叫它 —— 前后都贴着汉字，按没@人处理。
   assert.equal(h.hasNameMention('叫大肥鱼的人真多', '大肥鱼'), false);
   // 取舍：中文名前面紧贴汉字就算「不是叫名字」，「在吗鲸鱼」这种不点名的口语会漏。
   // 有 @ 或标点就照常命中；宁可漏一次也好过被「这个鲸鱼玩偶」这种句子叫醒。

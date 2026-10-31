@@ -98,5 +98,80 @@ await test('pseudoToolNames 返回小写名字集合', () => {
   assert.equal([...names].length, 1, '只有一个工具名');
 });
 
+// ── 交接提醒：伪调用没发出去时，提醒要说清「想调什么 / 还没读几 / 水位推到哪」 ──
+// 2026-10-31 16:06 那次，它写坏了 mark_read(throughSeq=48)，那个 48 根本没生效，
+// 它不知道推到哪里才算完，只能 mark_read → 失败 → get_unread → mark_read 连试五圈。
+// 桥接这边全都算得出来，所以把这些直接摆到提醒里。
+
+const GROUP2 = 'group:456';
+
+function seedGroup() {
+  // 造三条未读（seq 5、6、7），其中 6 带图；模型只见过 5。
+  const st = h.getSocialV2State(GROUP2);
+  st.unread = [];
+  st.modelSeenSeqs = new Set();
+  st.lastReadThroughSeq = 4;
+  st.lastUnreadSeq = 7;
+  h.appendSocialV2Message(GROUP2, '甲群友', '第一条', '第一条', false, false, '1001', [], '900001');
+  h.appendSocialV2Message(GROUP2, '乙群友', '[图片]', '[图片]', false, false, '-1002', [{ kind: 'image', file: 'a.jpg', url: 'https://example.com/a.jpg', summary: '[图片]' }], '900002');
+  h.appendSocialV2Message(GROUP2, '丙群友', '第三条', '第三条', false, false, '1003', [], '900003');
+  const after = h.getSocialV2State(GROUP2);
+  after.modelSeenSeqs = new Set([after.unread[0].seq]);
+  return after;
+}
+
+await test('伪调用是 mark_read、还有没读的：说清现在收尾会被拦，不给水位', () => {
+  const st = seedGroup();
+  const seqs = st.unread.map((m) => m.seq);
+  assert.equal(seqs.length, 3, '三条未读');
+  const handoff = h.describePseudoHandoffV2(st, INCIDENT);
+  assert.match(handoff, /【上一轮没接上】/, '要明说上一轮没接上');
+  assert.match(handoff, /qq_mark_read/, '要说出它想调的是哪个工具');
+  assert.match(handoff, /还没读：2 条/, '只说没展示给它的那两条');
+  // 未读没看完时给水位是反效果：它会照抄那个数去收尾，然后把没看的标成已读。
+  assert.match(handoff, /会被拦下/, '要说明现在收尾会被拦');
+  assert.doesNotMatch(handoff, /throughSeq 用/, '还有没读的就别给水位');
+  assert.doesNotMatch(handoff, /98/, '它写坏的参数不该被采信');
+});
+
+await test('伪调用是 mark_read、已经全读完了：这时才给水位', () => {
+  const st = seedGroup();
+  st.modelSeenSeqs = new Set(st.unread.map((m) => m.seq));
+  const handoff = h.describePseudoHandoffV2(st, INCIDENT);
+  assert.match(handoff, /throughSeq 用 \d+/, '全读完了才给水位');
+  assert.doesNotMatch(handoff, /还没读：/, '都看过了就别再报未读');
+});
+
+await test('交接里点名带图的消息（否则它不知道该看哪张）', () => {
+  const st = seedGroup();
+  const handoff = h.describePseudoHandoffV2(st, INCIDENT);
+  assert.match(handoff, /带图的消息：/, '要说哪条带图');
+  assert.match(handoff, /id=-1002/, '带上真实 messageId（引用/看图都要这个）');
+});
+
+await test('伪调用不是收尾工具时，照样给未读清单但不提收尾', () => {
+  const st = seedGroup();
+  const text = '<mcp__snowluma__qq_get_message_images><parameter name="messageId">-1002</parameter></mcp__snowluma__qq_get_message_images>';
+  const handoff = h.describePseudoHandoffV2(st, text);
+  assert.match(handoff, /qq_get_message_images/);
+  assert.doesNotMatch(handoff, /qq_mark_read/, '没打算收尾就别教它收尾');
+});
+
+await test('没有伪调用时返回空串（走原来的普通提醒）', () => {
+  assert.equal(h.describePseudoHandoffV2(h.getSocialV2State(GROUP2), '我想了想，还是不说话了'), '');
+  assert.equal(h.describePseudoHandoffV2(null, ''), '');
+});
+
+await test('提醒正文：有伪调用就换成交接，没有还是老那句', () => {
+  const st = seedGroup();
+  const withPseudo = h.buildWakeReminderPromptV2(GROUP2, INCIDENT);
+  assert.match(withPseudo, /【上一轮没接上】/, '要有交接段');
+  assert.doesNotMatch(withPseudo, /【提醒】本轮还没收尾/, '不该再发那句空的催办');
+
+  const plain = h.buildWakeReminderPromptV2(GROUP2, '我想了想，还是不说话了');
+  assert.match(plain, /【提醒】本轮还没收尾/, '没伪调用时保持原样');
+  assert.doesNotMatch(plain, /【上一轮没接上】/);
+});
+
 console.log(`\n${failed === 0 ? 'ALL PASS' : 'FAILED'} passed=${passed} failed=${failed}`);
 process.exit(failed === 0 ? 0 : 1);

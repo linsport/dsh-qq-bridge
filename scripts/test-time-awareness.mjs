@@ -99,7 +99,7 @@ await test('新消息（几秒前）：快照里标着刚发的，不是旧账',
   await withBridge(async (h) => {
     append(h, '在吗');
     const rendered = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(KEY));
-    assert.match(rendered, /小明（未点名）·\d+秒前：在吗/, `新消息该标秒级：\n${rendered}`);
+    assert.match(rendered, /小明（没@人）·\d+秒前：在吗/, `新消息该标秒级：\n${rendered}`);
   });
 });
 

@@ -131,12 +131,12 @@ await test('老 config.json 的 wake 段缺新键时，深度合并仍给出默�
   // 而 loadConfig 是顶层 spread，整段 wake 被覆盖，于是观望窗口一次都没开过。
   const h = await bridgeHarness({ config: { socialV2: { wake: { defaultMode: 'diving', batchWindowMs: 3000, sleepMinMs: 30000 } } } });
   h.setMode('reserved2');
-  assert.equal(h.postReplyWatchMs(), 120000, '缺键时应该回落到默认 120000');
+  assert.equal(h.postReplyWatchMs(), 180000, '缺键时应该回落到默认 180000');
   assert.equal(h.cfg.socialV2.wake.batchWindowMs, 3000, '显式写了的仍要用配置值');
   assert.equal(h.cfg.socialV2.wake.sleepMinMs, 30000);
 });
 
-await test('config 里显式写 0 的观望窗口不会被默认值顶回 120000', async () => {
+await test('config 里显式写 0 的观望窗口不会被默认值顶回 180000', async () => {
   const h = await bridgeHarness({ config: { socialV2: { wake: { postReplyWatchMs: 0 } } } });
   h.setMode('reserved2');
   assert.equal(h.postReplyWatchMs(), 0);

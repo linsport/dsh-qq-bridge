@@ -112,7 +112,7 @@ console.log('## 收尾后观望');
   const n = (html.match(new RegExp('id="v2PostReplyWatchMs"', 'g')) ?? []).length;
   ok(n === 1, '收尾后观望控件 v2PostReplyWatchMs', `${n} 处`);
 }
-ok(/v2PostReplyWatchMs'\)\.value = Math\.round\(\(w\.postReplyWatchMs \?\? 120000\) \/ 1000\)/.test(html),
+ok(/v2PostReplyWatchMs'\)\.value = Math\.round\(\(w\.postReplyWatchMs \?\? 180000\) \/ 1000\)/.test(html),
   '收尾后观望从配置回填（毫秒转秒）');
 ok(/postReplyWatchMs: Math\.max\(0, Math\.round\(Number\(document\.getElementById\('v2PostReplyWatchMs'\)\.value\) \|\| 0\)\) \* 1000/.test(html),
   '收尾后观望进 saveV2Config 的 wake body（秒转毫秒）');

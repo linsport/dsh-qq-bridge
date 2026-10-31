@@ -67,7 +67,7 @@ function ok(name) {
 {
   const ctx = buildSlangContext([
     {
-      content: '假肥鱼',
+      content: '冒名号',
       meaning: '指冒用别人昵称的"高仿号" & 冒充者',
       usage: '只在重名语境里成立（"顶着名字"）',
       status: SLANG_STATUS.CONFIRMED,

@@ -1064,7 +1064,7 @@ const QZONE_PROMPT_MAX_CHARS = 1400;
 // 提成常量是因为它现在有两个来源：配置 socialV2.context.wakeCheckPrompt（空=不注入）
 // 和这段内置默认。控制台的「填回内置默认」按钮就是把这段原样写回去，
 // 所以两边必须是同一份字符串，不能各抄一遍。
-const WAKE_CHECK_DEFAULT_PROMPT = "【醒来先过三关】① 看时间：每条都带「多久前」，看**最新那条和叫你的那条**一起判 —— 超 120 分钟默认不接（除非明确点你、且答了现在还有用），超 10 分钟别用「刚」「哈哈哈刚看到」这种实时语气；② 看对象：只有（@你）或引用了你的消息才算叫你，（未点名）（@别人）是他们在聊，里面的「你」不是你；③ 看话头：你要接的这句是不是已经有人答了、话题是不是后面已经翻篇 —— 答过了别重答，翻篇了就接新的或干脆不说，不用硬找话。";
+const WAKE_CHECK_DEFAULT_PROMPT = "【醒来先过三关】① 看时间：每条都带「多久前」，看**最新那条和叫你的那条**一起判 —— 超 120 分钟默认不接（除非明确点你、且答了现在还有用），超 10 分钟别用「刚」「哈哈哈刚看到」这种实时语气；② 看对象：`（@你）`、引用了你的消息、上文正说到你和主人 —— 这几种多半在问你；`（@别人）`、`（没@人）` 只说明没有 at，不代表不关你事，结合前后自己判断。**接话之前先把这一段读懂**：他们在聊什么、上一条是谁在接谁的话题、中间有没有人插进来。读懂了，这句在接谁自然就清楚，不用靠数标记。判断错了就当场改口，这很正常；③ 看话头：你要接的这句是不是已经有人答了、话题是不是后面已经翻篇 —— 答过了别重答，翻篇了就接新的或干脆不说，不用硬找话。";
 const WAKE_CHECK_PROMPT_MAX_CHARS = 2000;
 
 // socialV2.wake 的默认段。
@@ -1098,7 +1098,7 @@ const WAKE_CONFIG_DEFAULTS = Object.freeze({
   // 为什么不是让她「每轮都多等几分钟」：等待是实打实占着会话的（等待期间
   // 新消息全被繁忙挡在队列里）。观望窗口是**不收尾**的另一种写法：会话已经
   // 交还，只是名单里多留一个「这人在跟我聊」。
-  postReplyWatchMs: 120000,
+  postReplyWatchMs: 180000,
   recommendedSleepMinMs: 300000,
   recommendedSleepMaxMs: 7200000,
   recommendedProbability: 0.15,
@@ -1118,7 +1118,10 @@ const WAKE_CONFIG_DEFAULTS = Object.freeze({
   maxWakePerMinute: 1,
   maxWakePerHour: 12,
   noActionLimit: 3,
-  maxWakeConfigReminders: 2
+  maxWakeConfigReminders: 2,
+  // 伪调用交接提醒的连续上限。跟上面那个不是一个东西：那个管「忘了收尾」，
+  // 这个管「调用发不出去」。到顶就退回沉默，别拿它当循环燃料。
+  maxPseudoHandoffReminders: 3
 });
 // socialV2.context 的默认段。
 //
@@ -3385,6 +3388,9 @@ async function main() {
   const wakeConfigUpdatedKeys = new Set();
   const markReadCalledKeys = new Set();
   const wakeConfigMissCount = new Map();
+  // 伪调用交接提醒的连续次数。和上面的 miss 计数分开记：那个数的是「忘了收尾」，
+  // 这个数的是「调用没发出去」。混在一起会让真正忘了收尾的会话提前被重置。
+  const pseudoReminderMissCount = new Map();
   const reverse = new Map(); // sessionId -> conv key
   for (const [key, sessionId] of Object.entries(state.sessions)) reverse.set(sessionId, key);
   // 新版 DSH 事件流需要显式 follow；启动时为已持久化的 QQ 会话补上。
@@ -5768,7 +5774,7 @@ async function main() {
           // wake：数值与字符串数组归一化
           if (body.wake && typeof body.wake === 'object') {
             merged.wake = { ...(current.wake ?? {}), ...body.wake };
-            for (const k of ['sleepMinMs', 'sleepMaxMs', 'recommendedSleepMinMs', 'recommendedSleepMaxMs', 'recommendedProbability', 'batchWindowMs', 'batchWindowMsPrivate', 'postReplyWatchMs', 'maxWakePerMinute', 'maxWakePerHour', 'noActionLimit', 'maxWakeConfigReminders']) {
+            for (const k of ['sleepMinMs', 'sleepMaxMs', 'recommendedSleepMinMs', 'recommendedSleepMaxMs', 'recommendedProbability', 'batchWindowMs', 'batchWindowMsPrivate', 'postReplyWatchMs', 'maxWakePerMinute', 'maxWakePerHour', 'noActionLimit', 'maxWakeConfigReminders', 'maxPseudoHandoffReminders']) {
               if (merged.wake[k] !== undefined) {
                 const n = Number(merged.wake[k]);
                 merged.wake[k] = Number.isFinite(n) ? n : current.wake?.[k] ?? 0;
@@ -5989,6 +5995,7 @@ async function main() {
           wakeConfigUpdatedKeys.clear();
           markReadCalledKeys.clear();
           wakeConfigMissCount.clear();
+          pseudoReminderMissCount.clear();
           socialV2.paused = false;
           try { atomicWriteJson(SOCIAL_V2_FILE, { conversations: {} }); } catch (error) { log('重置二代状态：写空状态文件失败:', error?.message ?? error); }
           log('控制台：二代 AI 状态已重置（会话、定时器、唤醒配置已清空，工具日志保留）');
@@ -6459,8 +6466,8 @@ async function main() {
           st.wakeConfig.confirmedAt = Date.now();
           st.wakeConfig.confirmedBy = 'mark_read';
           // 收尾后开一段观望窗口：见 armWatchWindowV2 的注释。
-          const watchUntil = armWatchWindowV2(st, key);
-          if (watchUntil) log(`[reserved2] ${key} 收尾后观望 ${Math.round((watchUntil - Date.now()) / 1000)} 秒，期间相关的话还能叫醒`);
+          const watchBefore = Number(st.watchUntil) || 0;
+          logWatchWindowV2(key, watchBefore, armWatchWindowV2(st, key));
           markReadCalledKeys.add(key);
           saveSocialV2State();
           log(`[reserved2] 控制台/工具标记 ${key} 未读已读：${markedCount} 条，已确认下一次唤醒配置`);
@@ -6610,7 +6617,11 @@ async function main() {
           st.lastActionAt = Date.now();
           // 和 qq_mark_read 那条路径一致：收尾后先观望一阵再真的潜水（见 armWatchWindowV2）。
           // 她收尾时几乎都走这条路，漏了这边等于窗口根本不生效。
-          armWatchWindowV2(st, key);
+          //
+          // 打了日志才算可验证：2026-10-31 排查时只搜「收尾后观望」，这条路径一句不打，
+          // 看着像功能没生效，其实窗口早开了 —— 只能翻 social-v2.json 才发现。
+          const watchBefore = Number(st.watchUntil) || 0;
+          logWatchWindowV2(key, watchBefore, armWatchWindowV2(st, key));
           saveSocialV2State();
           wakeConfigUpdatedKeys.add(key);
           wakeConfigMissCount.delete(key);
@@ -11317,38 +11328,23 @@ async function main() {
   // 因为误醒一轮要烧掉整个回合，漏接一次只是少说一句。
   const QUESTION_FOLLOW_UP_MS = 60 * 1000;
 
-  // 观望窗口的「同一个对话段」判据：距上一次开窗多久以内，算还在同一段对话里，
-  // 这轮收尾就不重开（见 armWatchWindowV2）。取 2 倍窗口长度而不是固定值，
-  // 这样操作者把 postReplyWatchMs 调大调小都跟得上。
-  const WATCH_REOPEN_GAP_MS_DEFAULT = 2 * 60 * 1000;
-  function watchReopenGapMs() {
-    const ms = postReplyWatchMs();
-    return ms > 0 ? ms * 2 : WATCH_REOPEN_GAP_MS_DEFAULT;
-  }
-
-  // 观望窗口内「还在跟她聊的那个人」走多近才算话头没断。
-  const WATCH_PARTNER_GAP_MS = 3 * 60 * 1000;
-
-  // 找出「她上一次开口是回给谁的」。
+  // 观望窗口的总时长上限：一次连续的观望（从第一轮收尾算起）最多守这么久。
   //
-  // 依据是 recentMessages 里她自己那条（isSelf）之前、最近的一条别人发的消息。
-  // 只能靠 recentMessages：recordSentMessagesV2 往里面写自己的话时本来就有完整的
-  // 前后文，比另存一个字段可靠（也不会在重启后丢）。
-  function watchConversationPartner(st) {
-    const list = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
-    for (let i = list.length - 1; i >= 0; i -= 1) {
-      const m = list[i];
-      if (!m || !m.isSelf) continue;
-      for (let j = i - 1; j >= 0; j -= 1) {
-        const prev = list[j];
-        if (!prev || prev.isSelf) continue;
-        return { userId: String(prev.userId ?? ''), sender: String(prev.sender ?? '') };
-      }
-      return null;
-    }
-    return null;
-  }
+  // 为什么需要它：每轮收尾都往后延（见 armWatchWindowV2），只要群一直有人在说话，
+  // 理论上就能无限续下去 —— 2026-10-31 实测过这个形态（半小时 47 次「收尾后观望」、
+  // watch 唤醒 23 次）。操作者要的是「每次请求都带一段观望」，不是「永远守着」，
+  // 所以这里给一段对话总共封顶 WATCH_MAX_TOTAL_MS，超了就停在原地不再延。
+  const WATCH_MAX_TOTAL_MS = 30 * 60 * 1000;
 
+  // 观望窗口内"是不是还在跟她说"的判据，2026-10-31 晚放宽过一次，原因如下。
+  //
+  // 上一版要求「只有她最后回的那个人接着说」才算。实测当晚群里就漏了该接的话：
+  //   她刚回完 A 收尾 → 十几秒后 B 顺着同一个梗接了一句
+  //   判据一看"不是 A"，放过去了；可 A、B 在同一个梗里轮着说话。
+  // 群聊本来就好几个人接力，把"刚跟她说话的人"锁死成一个，等于只认一对一私聊的形态。
+  //
+  // 现在改成：窗口内谁说话都算。滚雪球由 armWatchWindowV2 的总时长上限挡着 ——
+  // 一段对话最多守 WATCH_MAX_TOTAL_MS，所以最坏情况是多醒几轮，不会无限续命。
   function questionTargetsMe(st, event, plainContent, quoteTargetIsSelf) {
     const segments = Array.isArray(event?.message) ? event.message : [];
     const selfId = String(event?.self_id ?? '');
@@ -11387,12 +11383,24 @@ async function main() {
   // `if (kind === 'private') return 'private'`，私聊的每条消息本来就会叫醒她，
   // 再记一个 watchUntil 只是往状态文件里写一条永远读不到的废数据。
   //
-  // ⚠️ 一个「对话段」只开一次（2026-10-31 审查实测出来的滚雪球）：原来这里每次收尾
-  // 都无条件 watchUntil = now + ms，于是
-  //   闲聊 → 以 watch 醒来 → 这轮再收尾 → 又开 60 秒 → 无限续命
-  // 日志里 15:46–16:09 半小时「收尾后观望」47 次、watch 唤醒 23 次（当天最多的唤醒原因）。
-  // 现在窗口开过一次就记下 watchOpenedAt；只要上一次窗口还没老化（见
-  // watchReopenGapMs），这轮收尾就不再重开 —— 也就是说一个对话段最多守一轮。
+  // 观望窗口是**倒计时**，只有「她在群里发消息」才重置。
+  //
+  // 语义演进（2026-10-31 一天里改到第四版，记这里免得再走回头路）：
+  //   ① 最初：每次收尾都无条件 watchUntil = now + ms —— 于是「闲聊 → 以 watch 醒来
+  //      → 这轮再收尾 → 又开窗」滚雪球，日志里半小时 47 次「收尾后观望」。
+  //   ② 改成「一个对话段只开一次窗」—— 又过头了，第二次收尾完全不长。
+  //   ③ 改成「任何新消息重置倒计时」—— 不对：别人刷屏、她一声不吭也续，
+  //      等于她人已经不在对话里了，窗口却一直挂着。
+  //   ④ 改成「收尾也重置 + 她发消息也重置」—— 还是不对。收尾本来就每轮都发生，
+  //      让她靠反复收尾（哪怕一句话没说）就能一直续命，操作者实测 22:55–22:57
+  //      连着五次「收尾后观望 60 秒」，人根本没开口。
+  //   ⑤ 现在（最终）：**开窗只由收尾触发，续窗只由「她自己发了消息」触发**。
+  //      收尾时窗口已开着 → 一律不动（不续命）。
+  //      她发消息时 → refreshWatchWindowV2 把倒计时重置回满。
+  //      别人说话她没接 → 时间照走，到点就睡。
+  //
+  // 防滚雪球靠的是一段对话的总时长上限 WATCH_MAX_TOTAL_MS（从 watchOpenedAt 算起）：
+  // 连续聊到 30 分钟就把窗口收回到上限处，不至于把整个会话占成常驻。
   function armWatchWindowV2(st, key = '') {
     const ms = postReplyWatchMs();
     if (!ms || !st) return 0;
@@ -11402,15 +11410,60 @@ async function main() {
     const now = Date.now();
     const lastReply = Number(st.lastAiReplyAt) || 0;
     if (!lastReply || now - lastReply > 10 * 60 * 1000) return 0;
-    // 已经开过、且那次开窗还在「同一个对话段」内 → 不重开，直接把原来的截止时刻还回去。
+    // 窗口还开着 → **一律不动**。续命的唯一入口是 refreshWatchWindowV2（她自己开口），
+    // 这里再续一次就等于「她一句话没说，光靠反复收尾也能一直在观望里」——
+    // 2026-10-31 22:55 实测：收尾 60 秒 → 20 秒后她没吭声又收尾 → 又变回 60 秒，
+    // 一路续到 22:57 还在 watch。收尾只负责「开」，不负责「续」。
     const openedAt = Number(st.watchOpenedAt) || 0;
-    if (openedAt > 0 && now - openedAt <= watchReopenGapMs()) {
-      st.watchUntil = Number(st.watchUntil) > now ? Number(st.watchUntil) : 0;
+    const prevUntil = Number(st.watchUntil) || 0;
+    if (prevUntil > now) {
+      // 只有一种情况要动：这段对话已经聊满总上限，那就把窗口收回到上限处，
+      // 别让它靠反复收尾无限延长。
+      const cap = (openedAt > 0 ? openedAt : now) + WATCH_MAX_TOTAL_MS;
+      if (prevUntil > cap) st.watchUntil = cap;
       return st.watchUntil;
     }
+    // 窗口已经过期（或从没开过）→ 开始一段新的观望，重新起算总时长。
     st.watchOpenedAt = now;
     st.watchUntil = now + ms;
     return st.watchUntil;
+  }
+
+  // 她自己开口时把观望倒计时重置回满（操作者要的语义：30 秒内她又说了一句，
+  // 时间就重新算 30 秒）。只对**已经在观望中**的会话生效 —— 窗口没开的会话
+  // 不该因为她说了句话就凭空多出一段观望，那就不叫「收尾后再守一会儿」了。
+  function refreshWatchWindowV2(st) {
+    if (!st) return 0;
+    const now = Date.now();
+    const prevUntil = Number(st.watchUntil) || 0;
+    if (!(prevUntil > now)) return 0;
+    const ms = postReplyWatchMs();
+    if (!ms) {
+      st.watchUntil = 0;
+      return 0;
+    }
+    const openedAt = Number(st.watchOpenedAt) || 0;
+    const cap = (openedAt > 0 ? openedAt : now) + WATCH_MAX_TOTAL_MS;
+    const next = Math.min(cap, now + ms);
+    st.watchUntil = next > now ? next : prevUntil;
+    return st.watchUntil;
+  }
+
+  // 把「这次收尾对观望窗口做了什么」说清楚。操作者 2026-10-31 22:5x 看着日志里
+  // 连着五次「收尾后观望 60 秒」，以为窗口在无限续命、改动没生效 —— 其实每次都只是
+  // 把「还剩多少」印成了满额。现在分开写：新开的写「开启 N 秒」，已经开着的一律写
+  // 「不续时，还剩 N 秒」，一眼能看出倒计时到底在不在走。
+  function logWatchWindowV2(key, beforeUntil, afterUntil) {
+    if (!afterUntil) return;
+    const left = Math.max(0, Math.round((afterUntil - Date.now()) / 1000));
+    const renewed = Number(beforeUntil) > 0 && afterUntil > Number(beforeUntil);
+    if (renewed) {
+      log(`[reserved2] ${key} 收尾后观望：续时到 ${left} 秒（她自己刚说过话）`);
+    } else if (Number(beforeUntil) > 0) {
+      log(`[reserved2] ${key} 收尾后观望：不续时，还剩 ${left} 秒`);
+    } else {
+      log(`[reserved2] ${key} 收尾后观望：开启 ${left} 秒，期间相关的话还能叫醒`);
+    }
   }
 
   function inWatchWindowV2(st) {
@@ -12557,6 +12610,13 @@ async function main() {
       });
     }
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    // 观望窗口是倒计时，重置条件是「她自己又开口了」而不是「有人说话」（见 armWatchWindowV2 注释）。
+    // 别人刷屏但她没接，说明这段对话确实跟她没关系，倒计时就该继续走完。
+    const watchBeforeSend = Number(st.watchUntil) || 0;
+    const watchAfterSend = refreshWatchWindowV2(st);
+    if (watchAfterSend) {
+      log(`[reserved2] ${key} 她开口了，观望倒计时重置回 ${Math.round((watchAfterSend - Date.now()) / 1000)} 秒（原剩 ${Math.max(0, Math.round((watchBeforeSend - Date.now()) / 1000))} 秒）`);
+    }
     saveSocialV2State();
   }
 
@@ -12733,34 +12793,21 @@ async function main() {
     }
     // 有「你」+问句词还不够：还得确认这句是在问她（见 questionTargetsMe 的注释）。
     if (tr.question && isDirectedAtAi(plainContent) && questionTargetsMe(st, event, plainContent, quoteTargetIsSelf)) return 'question';
-    // 收尾后的观望期：刚才聊的人接着说话，就算没 @ 也算把话递过来了。
+    // 收尾后的观望期：这段时间里群里有人说话，就算没 @ 也算把话递过来了。
+    //
     // 放在 probability 之前 —— 概率是「找点事做」，这个是「有人还在跟你说」。
-    if (inWatchWindowV2(st) && !sleeping) {
-      const segments2 = Array.isArray(event?.message) ? event.message : [];
-      const selfId2 = String(event?.self_id ?? '');
-      const atSelf2 = segments2.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === selfId2);
-      const lower2 = String(plainContent ?? '').toLowerCase();
-      const named = !!selfNickname && hasNameMention(lower2, selfNickname.toLowerCase());
-      if (atSelf2 || quoteTargetIsSelf || named) return 'watch';
-      // 刚才跟她说话的那个人接着说，才算「话头还没断」。
-      //
-      // 原来这里是 `Date.now() - st.lastIncomingAt <= 3 分钟`，但 lastIncomingAt 在
-      // appendSocialV2Message 里已经被**当前这条消息自己**刷成 now 了（handleIncoming
-      // 先入库再判唤醒），差值恒为 0 —— 于是窗口内任何一句闲聊都能把她叫起来
-      // （2026-10-31 审查实测：「今天好热」「谁去吃午饭」全部返回 watch）。
-      // 现在先认人再认时间：只有「她最后回复的那个人」继续说话才算。
-      const partner = watchConversationPartner(st);
-      if (partner) {
-        const speakerId2 = String(event?.user_id ?? event?.sender?.user_id ?? '');
-        const speakerName2 = String(event?.sender?.card || event?.sender?.nickname || '');
-        const samePerson = (partner.userId && speakerId2 && partner.userId === speakerId2)
-          || (partner.sender && speakerName2 && partner.sender === speakerName2);
-        if (samePerson) {
-          const lastReply2 = Number(st.lastAiReplyAt) || 0;
-          if (lastReply2 > 0 && Date.now() - lastReply2 <= WATCH_PARTNER_GAP_MS) return 'watch';
-        }
-      }
-    }
+    //
+    // 判据演进（别再退回一对一）：
+    //   ① 最初是 `Date.now() - st.lastIncomingAt <= 3 分钟` —— 但 lastIncomingAt 在
+    //      appendSocialV2Message 里已被**当前这条消息自己**刷成 now（handleIncoming
+    //      先入库再判唤醒），差值恒为 0，窗口内任何闲聊都能叫醒她。
+    //   ② 改成「只认她最后回的那个人」—— 又太窄，实测漏掉了别人接同一个梗那条
+    //      （见上面 WATCH_MAX_TOTAL_MS 附近的注释）。
+    //   ③ 现在：窗口内谁说都算；倒计时只在她自己开口时重置（refreshWatchWindowV2），
+    //      别人刷屏不续命。滚雪球交给 watchOpenedAt 起算的总时长上限。
+    //
+    // @ 了她 / 引用她 / 叫了名字 本来就会在前面几个分支命中，这里主要接"没点名但还在聊"。
+    if (inWatchWindowV2(st) && !sleeping) return 'watch';
     if (Array.isArray(tr.speakerIds) && tr.speakerIds.length) {
       const speakerId = String(event?.user_id ?? event?.sender?.user_id ?? '');
       if (speakerId && tr.speakerIds.some((id) => String(id) === speakerId)) {
@@ -12943,9 +12990,15 @@ async function main() {
     const unread = Array.isArray(snapshot.messages) ? snapshot.messages : [];
     const recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
     const who = (m) => (m && m.isSelf ? '我' : String(m?.sender || '某人'));
-    // 群聊里标出「这条在对谁说」：`（@甲群友）` / `（@你）` / `（未点名）`。
+    // 群聊里标出「这条在对谁说」：`（@甲群友）` / `（@你）` / `（没@人）`。
     // 不标的话模型只能靠上下文推理「你」是谁 —— 实测它把別人之间的对话当成问自己
     // （2026-10-30 群 100002 seq131）。私聊不标：每句本来就是对你说的。
+    //
+    // **第三个标记只陈述事实，不替模型下结论**（2026-10-31 操作者指出）。
+    // 它原来叫「（未点名）」，配合 persona 里那句「多半不是在问你」，等于桥接替她
+    // 把「这算不算在跟我说话」判完了 —— 日志里她原话是「都没有点名我。我不插话」。
+    // 事实只是「这条没有 at 段」；至于是不是对着她说，上下文里写着呢，她自己有眼睛。
+    // 改成「（没@人）」：说清楚它是什么，别让它听起来像一句判词。
     const addressMark = (m) => {
       if (!snapshot.group || m?.isSelf) return '';
       // 拍一拍没有 at 段，它「对谁说」写在 poke.targetIsSelf 里。
@@ -12966,7 +13019,7 @@ async function main() {
         .filter(Boolean);
       if (toMe) return others.length ? `（@你 @${others.join('、')}）` : '（@你）';
       if (others.length) return `（@${others.join('、')}）`;
-      return '（未点名）';
+      return '（没@人）';
     };
     const one = (m) => {
       const seq = Number.isSafeInteger(m?.seq) && m.seq > 0 ? `#${m.seq} ` : '';
@@ -13182,14 +13235,72 @@ async function main() {
     return `${base}${wakeCheckLineV2()}`;
   }
 
-  function buildWakeReminderPromptV2(key) {
+  // 上一轮把工具调用写成了文字时，光说「本轮还没收尾」它只能自己猜。
+  // 2026-10-31 16:06 那次它连试了五圈 mark_read / get_unread 才把水位推过去 ——
+  // 因为写坏的 mark_read(throughSeq=48) 里那个 48 根本没生效，它不知道推到哪里才算完。
+  // 桥接这边水位、带图消息、未读 seq 全是现成的，只是从来没进过提醒。
+  //
+  // 这里只陈述事实与手头的数据，不写「你应该怎么做」—— 那属于 persona，压不牢，
+  // 而且提醒越长它越容易把处理过程当成群消息说出来。
+  function describePseudoHandoffV2(st, turnText) {
+    const names = [...pseudoToolNames(turnText)];
+    if (!names.length) return '';
+    // 名字可能带前缀（mcp__snowluma__qq_mark_read / mcp_snowluma_qq_mark_read / qq_mark_read），
+    // 文案里统一只留最后那段 qq_xxx，免得同一件事出现三个名字。
+    const shortName = (name) => {
+      const idx = name.lastIndexOf('qq_');
+      return idx >= 0 ? name.slice(idx) : name;
+    };
+    const tools = [...new Set(names.map(shortName))];
+    const seen = st?.modelSeenSeqs instanceof Set ? st.modelSeenSeqs : new Set(st?.modelSeenSeqs || []);
+    const unseen = (st?.unread || []).filter((m) => !seen.has(m.seq));
+    const unseenSeqs = unseen
+      .map((m) => Number(m.seq))
+      .filter((seq) => Number.isSafeInteger(seq) && seq > 0)
+      .sort((a, b) => a - b);
+    const withMedia = unseen.filter((m) => (Array.isArray(m.media) && m.media.length) || m.hasMedia === true);
+    const through = readThroughSeqV2(st ?? { unread: [], lastReadThroughSeq: 0, lastUnreadSeq: 0, modelSeenSeqs: new Set() });
+
+    const head = `【上一轮没接上】你想调用 ${tools.join('、')}，但写成了文字 —— 那不算调用，桥接把那段删掉了，什么也没发生。`;
+    const todo = [];
+    if (unseenSeqs.length) {
+      const listed = unseenSeqs.slice(0, 5).join('、');
+      const more = unseenSeqs.length > 5 ? ` 等 ${unseenSeqs.length} 条` : '';
+      todo.push(`还没读：${unseenSeqs.length} 条（seq ${listed}${more}）`);
+    }
+    if (withMedia.length) {
+      const items = withMedia.slice(0, 3).map((m) => `#${m.seq}（id=${m.messageId}）`);
+      todo.push(`带图的消息：${items.join('、')}`);
+    }
+    // 收尾那行必须跟着未读状态走：还有没读的消息时给水位是**反效果** ——
+    // 它会照抄那个数去 mark_read，然后被「还有 N 条没读过」打回来（2026-10-31 16:28
+    // 自查发现：未读 5 条、水位 49，照做等于把没看的也标成已读）。
+    if (tools.includes('qq_mark_read')) {
+      if (unseenSeqs.length) {
+        todo.push('收尾：这几条没看之前，qq_mark_read 会被拦下（不会让你把没读的标成已读）');
+      } else if (through > 0) {
+        todo.push(`收尾用 qq_mark_read，throughSeq 用 ${through}`);
+      } else {
+        todo.push('收尾用 qq_mark_read（水位桥接这边还没有可推进的）');
+      }
+    } else if (tools.includes('qq_set_wake_config')) {
+      todo.push('收尾用 qq_set_wake_config（条件按你原本想设的填）');
+    }
+    if (!todo.length) return `${head}`;
+    return `${head}\n接着做：\n${todo.map((item) => `· ${item}`).join('\n')}`;
+  }
+
+  function buildWakeReminderPromptV2(key, turnText = '') {
     const roleState = readRoleState();
     const reminderRole = effectiveRoleName(key, roleState);
     const roleLine = reminderRole ? `【当前角色】${reminderRole}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const identityLine = cfg.socialV2?.injectViaSystemPrompt === true ? '' : selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = cfg.socialV2?.injectViaSystemPrompt === true ? '' : `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
-    // 观察窗口已退役（桥接在后台盯回复），提醒只说"忘了收尾会永眠"。
+    // 有伪调用就交出具体交接；没有才是普通「忘了收尾」。
+    // 观察窗口已退役（桥接在后台盯回复），普通提醒只说"忘了收尾会永眠"。
+    const handoff = describePseudoHandoffV2(st, turnText);
+    if (handoff) return `${roleLine}${identityLine}${tokenLine}${handoff}`;
     return `${roleLine}${identityLine}${tokenLine}【提醒】本轮还没收尾：用 qq_set_wake_config 或 qq_mark_read 收尾（忘了会「永眠」）。不用等任何观察窗口。`;
   }
 
@@ -13931,6 +14042,7 @@ async function main() {
     wakeConfigUpdatedKeys.clear();
     markReadCalledKeys.clear();
     wakeConfigMissCount.clear();
+    pseudoReminderMissCount.clear();
     messageMediaStore.clear();
   }
 
@@ -14646,8 +14758,9 @@ async function main() {
               const pseudo = turnText.trim()
                 ? stripPseudoToolCalls(turnText)
                 : { text: turnText, removed: 0 };
+              // 只判「整轮被伪调用占满」，不再区分它想调的是收尾工具还是别的：
+              // 两种情况都是「调用没发出去」，交给下面的交接提醒统一处理。
               const pseudoOnly = pseudo.removed > 0 && !pseudo.text.trim();
-              const pseudoFinish = pseudoOnly && pseudoFinishIntent(turnText);
               // reserved2 无行动兜底：普通唤醒回合若既没发消息、也没 mark_read / set_wake_config，
               // 则累计 noActionCount；达到阈值后自动重置 WakeConfig，避免 AI 卡死。
               const silentQueueNow = social.silentTurns.get(frame.sessionId) ?? [];
@@ -14709,13 +14822,50 @@ async function main() {
                   wakeConfigUpdatedKeys.delete(key);
                   markReadCalledKeys.delete(key);
                   wakeConfigMissCount.delete(key);
-                } else if (pseudoFinish) {
-                  // 它写了收尾、但只写成文本。重发提醒它还是会这么写，白烧一轮。
-                  // 不执行那个伪调用（参数是不可信输入），只是不再追问。
-                  wakeConfigMissCount.delete(key);
+                  // 这一轮接上了，连续写坏的计数也就清零 —— 上限管的是「连着」，
+                  // 不是「这一天在同一个群里出过几次」。
+                  pseudoReminderMissCount.delete(key);
+                } else if (pseudoOnly) {
+                  // 整轮正文被伪调用占满 —— 不管它想调哪个工具，这都是「调用没发出去」，
+                  // 不是「忘了收尾」。所以：
+                  //   · 不占**收尾** miss 计数（它没有忘记收尾，只是那一次采样写坏了）
+                  //   · 仍然发一条提醒，但内容换成带数据的交接（见 describePseudoHandoffV2）
+                  //
+                  // 以前这里发现是收尾类伪调用就沉默，理由是「重发提醒它还是会这么写，白烧一轮」。
+                  // 那个理由成立的前提是提醒里没有信息 —— 现在提醒会说清想调什么、还没读几、
+                  // 水位推到哪，沉默就没道理了：2026-10-31 16:06 正是靠它自己连试五圈才推过去。
+                  //
+                  // 但仍要一道闸：它要是**连着**几轮都写坏，光靠「不占 miss」就会无限提醒下去，
+                  // 每一轮都是真金白银。所以伪调用单独计数，超过上限就退回沉默 ——
+                  // 宁可这一轮白烧，也不能拿它当循环燃料。
+                  //
+                  // 仍然不执行那个伪调用：参数是不可信输入（群友的话可能混在里面）。
                   const names = [...pseudoToolNames(turnText)].join(', ');
-                  log(`[reserved2] ${key} 收尾只写在文本里（${names}），已丢弃且不补提醒`);
-                  appendActivity(`${key} agent 把收尾写成文本而不是真调用（${names}），本轮不补提醒`);
+                  const isFinish = pseudoFinishIntent(turnText);
+                  const pseudoMiss = (pseudoReminderMissCount.get(key) ?? 0) + 1;
+                  const pseudoMax = Number(cfg.socialV2?.wake?.maxPseudoHandoffReminders) || 3;
+                  wakeConfigMissCount.delete(key);
+                  if (pseudoMiss > pseudoMax) {
+                    pseudoReminderMissCount.delete(key);
+                    log(`[reserved2] ${key} 连续 ${pseudoMax} 次交接都没接上（${names}），不再提醒，本轮不发送`);
+                    appendActivity(`${key} agent 连写坏 ${pseudoMax} 次工具调用，已停止交接提醒`);
+                  } else {
+                    pseudoReminderMissCount.set(key, pseudoMiss);
+                    pendingWakeKeys.add(key);
+                    armPendingWakeLease(key);
+                    deliverPrompt(key, buildWakeReminderPromptV2(key, turnText)).then((result) => {
+                      if (result && result.ok === false) {
+                        pendingWakeKeys.delete(key);
+                        disarmPendingWakeLease(key);
+                      }
+                    }).catch((error) => {
+                      pendingWakeKeys.delete(key);
+                      disarmPendingWakeLease(key);
+                      log(`[reserved2] ${key} 交接提醒投递失败: ${error?.message ?? error}`);
+                    });
+                    log(`[reserved2] ${key} 伪调用没发出去（${names}${isFinish ? '，本来要收尾' : ''}），已发送交接提醒 (${pseudoMiss}/${pseudoMax})`);
+                    appendActivity(`${key} agent 把工具调用写成文本而不是真调用（${names}），已发送交接提醒 (${pseudoMiss}/${pseudoMax})`);
+                  }
                 } else {
                   const currentMiss = (wakeConfigMissCount.get(key) ?? 0) + 1;
                   const maxReminders = Number(cfg.socialV2?.wake?.maxWakeConfigReminders) || 2;
@@ -14723,7 +14873,7 @@ async function main() {
                     wakeConfigMissCount.set(key, currentMiss);
                     pendingWakeKeys.add(key);
                     armPendingWakeLease(key);
-                    deliverPrompt(key, buildWakeReminderPromptV2(key)).then((result) => {
+                    deliverPrompt(key, buildWakeReminderPromptV2(key, turnText)).then((result) => {
                       if (result && result.ok === false) {
                         pendingWakeKeys.delete(key);
                         disarmPendingWakeLease(key);
@@ -15017,6 +15167,7 @@ async function main() {
         wakeConfigUpdatedKeys.clear();
         markReadCalledKeys.clear();
         wakeConfigMissCount.clear();
+        pseudoReminderMissCount.clear();
         // 长轮询（qq_wait_for_messages）的租约也要清：它的 req.on('close') 在事件流
         // 断开时不一定触发，残留租约会用 429 卡住该会话最长 15 分钟的等待工具。
         activeWaits.clear();

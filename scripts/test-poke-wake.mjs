@@ -162,9 +162,9 @@ await test('私聊的拍一拍照常进未读', async () => {
 
 // ── 快照里的标记（2026-10-31 审查） ──────────────────────────────────────────
 // 拍一拍没有 at 段，「对谁说」写在 poke.targetIsSelf 里。原来 addressMark 只看
-// atTargets，于是「拍了拍 你」被标成（未点名）—— 正好撞上 persona 里刚加的
-// 「（未点名）多半不是在问你」，等于自己拆自己的台。
-await test('快照里拍我的拍一拍标（拍你），不是（未点名）', async () => {
+// atTargets，于是「拍了拍 你」被标成（没@人）—— 正好撞上 persona 里刚加的
+// 「（没@人）多半不是在问你」，等于自己拆自己的台。
+await test('快照里拍我的拍一拍标（拍你），不是（没@人）', async () => {
   const st = ready(groupKey);
   clearWake(st);
   st.unread = [];
@@ -173,7 +173,7 @@ await test('快照里拍我的拍一拍标（拍你），不是（未点名）',
   const snap = h.buildWakeSnapshotV2(groupKey);
   const text = h.renderWakeSnapshotV2(snap);
   assert.ok(text.includes('（拍你）'), '该标（拍你），实际:\n' + text);
-  assert.ok(!text.includes('（未点名）'), '不该标（未点名），实际:\n' + text);
+  assert.ok(!text.includes('（没@人）'), '不该标（没@人），实际:\n' + text);
   clearWake(st);
 });
 
@@ -198,7 +198,7 @@ await test('私聊快照里拍一拍不加标记（每句本来就是对你说�
   await h.handlePokeNotice({ sub_type: 'poke', self_id: SELF, user_id: '123' });
   const text = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(key));
   assert.ok(!text.includes('（拍你）'), '私聊不该标，实际:\n' + text);
-  assert.ok(!text.includes('（未点名）'), '私聊不该标，实际:\n' + text);
+  assert.ok(!text.includes('（没@人）'), '私聊不该标，实际:\n' + text);
   clearWake(st);
 });
 

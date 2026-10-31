@@ -60,7 +60,7 @@ const KEY = 'group:456';
 
 const BUILTIN_HEAD = '【醒来先过三关】';
 const BUILTIN_TIME = '超 120 分钟默认不接';
-const BUILTIN_TARGET = '（未点名）（@别人）是他们在聊';
+const BUILTIN_TARGET = '接话之前先把这一段读懂';
 
 await test('没配过时给的是内置默认，不是空', () => {
   const line = h.wakeCheckLineV2();

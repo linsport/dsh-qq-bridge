@@ -90,7 +90,7 @@ docs/
 > 因此：**要公开的新文档请放 `docs/guides/`**（新写的 `DSH_020_ADAPTATION.md` 就放这里）；
 > 放进那四个目录 = 只在本机可见，`git add` 会直接被 .gitignore 挡下。
 
-规则：**根目录只留 `README.md` / `README.en.md` / `RULES.md` 三个文档**，其余一律进 `docs/` 对应子目录，
+规则：**根目录只留 `README.md` / `RULES.md` 两个文档**，其余一律进 `docs/` 对应子目录，
 并在 [README.md](README.md) 索引里登记一行（含「仍然有效 / 被谁取代」）。
 
 ---

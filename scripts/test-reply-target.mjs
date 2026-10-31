@@ -106,14 +106,14 @@ await test('快照里每条消息都带自己的 id（不能只有带图的带�
 // seq131 乙群友问甲群友「你玩多久了」（没 @ 任何人的下一句），它抢答「我不玩枪」，
 // 被回「没问你」。根因是快照里没有「这条在对谁说」的结构信息：`@` 段在
 // segmentsToText 里早被压成 `@甲群友` 几个字，at 的 QQ 号没有任何字段留下来。
-// 契约：群聊快照每条都要标出 @你 / @别人 / 未点名；私聊不标（本就都是对你说的）。
+// 契约：群聊快照每条都要标出 @你 / @别人 / 没@人；私聊不标（本就都是对你说的）。
 await test('群聊快照标出每条在对谁说，私聊不标', async () => {
   h.setSelfIdentity('大肥鱼', '999');
   const key = 'group:100002';
   const st3 = h.getSocialV2State(key);
   st3.unread = [];
   st3.recentMessages = [];
-  // 未点名：就是 seq131 那种「你玩多久了」，谁都没 @。
+  // 没@人：就是 seq131 那种「你玩多久了」，谁都没 @。
   h.appendSocialV2Message(key, '乙群友', '你玩多久了', '你玩多久了', false, false, '501', [], '291', [], []);
   // @ 别人
   h.appendSocialV2Message(key, '乙群友', '@甲群友 不叫', '@甲群友 不叫', false, false, '502', [], '291', [],
@@ -125,7 +125,7 @@ await test('群聊快照标出每条在对谁说，私聊不标', async () => {
   h.appendSocialV2Message(key, '乙群友', '@大肥鱼 @甲群友 你们俩', '@大肥鱼 @甲群友 你们俩', false, false, '504', [], '291', [],
     [{ qq: '999', name: '大肥鱼' }, { qq: '10001', name: '甲群友' }]);
   const rendered = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(key));
-  assert.ok(rendered.includes('乙群友（未点名）·'), `未点名要标出来：\n${rendered}`);
+  assert.ok(rendered.includes('乙群友（没@人）·'), `没@人要标出来：\n${rendered}`);
   assert.ok(rendered.includes('乙群友（@甲群友）·'), `@别人要标名字：\n${rendered}`);
   assert.ok(rendered.includes('乙群友（@你）·'), `@自己要标「@你」：\n${rendered}`);
   assert.ok(rendered.includes('乙群友（@你 @甲群友）·'), `同时 @ 自己和别人要都标：\n${rendered}`);
@@ -137,7 +137,7 @@ await test('群聊快照标出每条在对谁说，私聊不标', async () => {
   pst.recentMessages = [];
   h.appendSocialV2Message(pk, '私聊', '在吗', '在吗', false, true, '601', [], '10001', [], []);
   const privateRendered = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(pk));
-  assert.ok(!privateRendered.includes('未点名'), `私聊不该标未点名：\n${privateRendered}`);
+  assert.ok(!privateRendered.includes('没@人'), `私聊不该标没@人：\n${privateRendered}`);
   assert.ok(!privateRendered.includes('@你'), `私聊不该标 @你：\n${privateRendered}`);
 });
 
