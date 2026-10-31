@@ -197,9 +197,26 @@ console.log('## 文档');
       ok(voice.includes(needle), 'docs/guides/VOICE.md 提到「' + needle + '」');
     }
   }
+  // ⚠️ 这两条断言 2026-11-01 改成「README 里还提语音才检查」的形态。
+  // 原因是它们守的东西已经不存在于本仓库：
+  //   - README 里原本那段讲的是仓库上一级的 ../voice-tool/（voice-gui.mjs / voice-cli.mjs），
+  //     该目录不在本仓库、本机也不存在；README 精简后按「其余指向原作者」把整段撤了。
+  //   - 语音功能本身从装好到现在一次都没启用过（config.socialV2.voice.enabled=false、
+  //     tools.sendVoice=false、audio/ 目录不存在、tool-calls.jsonl 里语音调用 0 次）。
+  // 不做成「删除断言」：真要哪天启用语音，README 就得重新交代入口与默认关闭这两件事，
+  // 那时这里会重新变成硬的 ok()，而不是静默放行。
   const readme = read('README.md');
-  ok(readme.includes('voice-gui.mjs') && readme.includes('voice-cli.mjs'), 'README 含两个语音工具的入口说明');
-  ok(/AI 发语音默认关闭/.test(readme), 'README 已知限制说明默认关闭');
+  // 判据只看「入口说明」本身，不看「语音」两个字 —— 血统表里写一句「上游带过来语音能力」是正常的，
+  // 不能因为那个词就把下面两条当成已经覆盖了。
+  if (!/voice-gui\.mjs|voice-cli\.mjs|发语音/.test(readme)) {
+    console.log('  ⏭  跳过：README 的语音入口断言（voice-gui.mjs / voice-cli.mjs / AI 发语音默认关闭）');
+    console.log('     原因：README 已不再提及语音 —— 该功能未启用（voice.enabled=false、tools.sendVoice=false），');
+    console.log('           且独立工具不在本仓库里。启用语音时请补回这两条说明，本断言会自动恢复为硬检查。');
+    console.log('     注意：这是**跳过，不是通过**。');
+  } else {
+    ok(readme.includes('voice-gui.mjs') && readme.includes('voice-cli.mjs'), 'README 含两个语音工具的入口说明');
+    ok(/AI 发语音默认关闭/.test(readme), 'README 已知限制说明默认关闭');
+  }
   ok(read('docs/README.md').includes('FOLDER_MAP.md'), 'docs/README.md 索引链接到 FOLDER_MAP.md');
   ok(exists(path.join('docs', 'FOLDER_MAP.md')), 'docs/FOLDER_MAP.md 存在');
 }
