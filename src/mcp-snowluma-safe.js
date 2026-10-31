@@ -832,7 +832,7 @@ server.tool(
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条。**换行不会分条**：字符串里的 \n 只会让这一条在客户端里显得像两段，不会变成两条消息 —— 想分条就把它们放进数组，一个元素一条。桥接看到字符串里带换行且每段都像完整一句话时，会替你把它们拆成多条发出去（返回里 splitFromNewline>0 就说明拆了），但那是兜底，别指望它'),
+    messages: z.union([z.string(), z.array(z.string()).min(1)]).describe('要发送的内容：字符串=一条；数组=分多条。要分条就传数组，一个元素一条，这是最干净的方式。字符串里带换行也行 —— 每段都像完整一句话时桥接会替你拆成多条发出去（返回里 splitFromNewline>0 表示拆了，附一句 note 说明）。分条是正常表达，不是错误，别因为怕「发多了」就把两句话硬挤进一条。'),
     replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）。也可以直接填唤醒快照里的序号（写 59 或 #59 都行）——桥接会自己换成真实消息 id。最稳的是抄本轮快照里那条消息括号内的 `id=…`。**只能引本轮新到的那几条**（快照【本轮消息】里的），引更早的会被桥接直接拒绝并在报错里列出可引的序号 —— 因为模型最常见的错不是拿错 id，而是沿着上一次引的那条一路用下去（2026-10-30 群 100002 连续两次）。真要回更早的消息，加 `quoteEarlier: true` 再发一次。**也别用你从旧对话里记住的 id**，它可能属于别的消息'),
     quoteEarlier: z.boolean().optional().describe('默认 false：只允许引用本轮新到的消息。要回更早的消息（比如补一句十分钟前的旧账）时传 true —— 不加它却引用旧消息，桥接会拒绝并告诉你本轮能引哪几条'),
     atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中用于点名某个人；与引用二选一即可，不要滥用）'),

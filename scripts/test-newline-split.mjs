@@ -89,6 +89,11 @@ try {
     assert.equal(res.status, 200, res.body);
     assert.equal(res.json.sent, 2, '应该拆成两条都发出去');
     assert.equal(res.json.splitFromNewline, 1, '要告诉模型它那句被拆了');
+    // 光回一个裸数字不够：模型身边并排放着 warn / hint，会把 1 读成「你违规了」。
+    // 2026-10-31 它正是这么理解的，之后就不再分条了。这句 note 必须是有话的。
+    assert.equal(typeof res.json.note, 'string', '拆条时要给一句说明，不能只回数字');
+    assert.ok(res.json.note.includes('不用改'), '说明要说清「这样发没问题」，不能像警告：' + res.json.note);
+    assert.equal(res.json.warn, undefined, '拆条不该再报「你把一句话拆开了」');
     const sent = sentTexts(h);
     assert.equal(sent[0], '行，那确实是我这边出问题了');
     assert.equal(sent[1], '以后我就一条一句，不给你添乱');

@@ -6926,9 +6926,14 @@ async function main() {
             // 换行拆分触发的 splitWarn 属于自打脸：那两条本来就是模型写在一段里的，
             // 是桥接替它按换行拆的，再回头警告「你像是把同一句话拆开了」没有意义。
             const splitWarn = splitFromNewline > 0 ? null : findSplitBoundaryWarning(messages);
-            // splitFromNewline：你那条本来是一个字符串、靠换行分了段，桥接替你拆成了 N 条 ——
-            // 下次要分条请直接传数组，别指望换行（模型踩过：以为发了两句，实际只发了一句）。
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(splitFromNewline > 0 ? { splitFromNewline } : {}), ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            // splitFromNewline：你那条本来是一个字符串、靠换行分了段，桥接替你拆成了 N 条。
+            // 这里必须配一句明文说明 —— 一开始只回一个裸数字，模型把它和旁边的 warn/hint
+            // 读成同一类「你做得不对」的信号，于是学乖了：以后一条说完，不再分条。
+            // 2026-10-31 实测它自己在思考里写「又犯了多条的毛病」。拆条本身没问题，别让它学错。
+            const splitNote = splitFromNewline > 0
+              ? `你那条里的换行已经拆成 ${messages.length} 条发出去了 —— 这样发没问题，不用改。`
+              : undefined;
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(splitFromNewline > 0 ? { splitFromNewline, note: splitNote } : {}), ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -7101,8 +7106,11 @@ async function main() {
             // 换行拆分触发的 splitWarn 属于自打脸：那两条本来就是模型写在一段里的，
             // 是桥接替它按换行拆的，再回头警告「你像是把同一句话拆开了」没有意义。
             const splitWarn = splitFromNewline > 0 ? null : findSplitBoundaryWarning(messages);
-            // splitFromNewline 见另一个发送端点的注释。
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(splitFromNewline > 0 ? { splitFromNewline } : {}), ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            // splitFromNewline 见另一个发送端点的注释（别只回裸数字，模型会读成警告）。
+            const splitNote = splitFromNewline > 0
+              ? `你那条里的换行已经拆成 ${messages.length} 条发出去了 —— 这样发没问题，不用改。`
+              : undefined;
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(splitFromNewline > 0 ? { splitFromNewline, note: splitNote } : {}), ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
