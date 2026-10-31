@@ -1,0 +1,173 @@
+// 时间观念回归：沉睡很久后被唤醒，模型必须看得出「这条是旧账」。
+//
+// 真实故障（操作者报告 + 会话实证）：
+//   有人发消息时 AI 正在沉睡；很久以后被唤醒，看到那条旧消息仍然当成"刚发的"去回复，
+//   甚至抢进早已散场的话题。两个根因：
+//     ① 模型看到的时间是裸 epoch（`time:1792294529471`），算不出"这是 38 分钟前"；
+//     ② 提示词里没有一条规则说"旧消息不该按实时对话接"。
+//
+// 本文件验证修复后的契约：at/ago 字段、提示词里的时间感分档、唤醒原因的年龄、���照头的时间。
+import assert from 'node:assert/strict';
+import { bridgeHarness } from './audit-bridge-harness.mjs';
+import { compactModelMessage, compactModelData, describeAge, serializeModelData } from '../src/qq-model-view.js';
+
+const KEY = 'group:456';
+const MIN = 60000;
+let failures = 0;
+let tests = 0;
+async function test(name, run) {
+  tests++;
+  try { await run(); console.log('PASS', name); }
+  catch (error) { failures++; console.error('FAIL', name, '—', error?.stack ?? error); }
+}
+
+// 固定 now 便于断言：2026-10-18 11:31:05 本地时间
+const NOW = new Date(2026, 9, 18, 11, 31, 5).getTime();
+
+// ── 1. 模型视图：epoch → at / ago ───────────────────────────────────────────
+await test('compactModelMessage 把 epoch 换成 at/ago，并去掉裸 time', () => {
+  const compact = compactModelMessage(
+    { seq: 7, sender: '小明', text: '在吗', time: NOW - 38 * MIN },
+    { now: NOW }
+  );
+  assert.equal(compact.time, undefined, '裸 epoch 不该再出现在模型视图里');
+  assert.equal(compact.ago, '38m');
+  assert.equal(compact.at, '10:53');
+  assert.equal(compact.text, '在吗');
+});
+
+await test('ago 单位：秒/分/时/天，未来时间夹到 0s', () => {
+  assert.equal(describeAge(NOW - 3000, NOW), '3s');
+  assert.equal(describeAge(NOW - 59 * 1000, NOW), '59s');
+  assert.equal(describeAge(NOW - 18 * MIN, NOW), '18m');
+  assert.equal(describeAge(NOW - 5 * 60 * MIN, NOW), '5h');
+  assert.equal(describeAge(NOW - 3 * 24 * 60 * MIN, NOW), '3d');
+  assert.equal(describeAge(NOW + 5 * MIN, NOW), '0s', '未来时间不能显示成负数');
+});
+
+await test('跨天的消息 at 带日期（否则"23:40"会被误读成今天）', () => {
+  const compact = compactModelMessage({ text: '晚安', time: new Date(2026, 9, 16, 23, 40).getTime() }, { now: NOW });
+  assert.equal(compact.at, '10-16 23:40');
+  // 10-16 23:40 → 10-18 11:31 约 36 小时，按天向下取整 = 1d
+  assert.equal(compact.ago, '1d');
+});
+
+await test('time 缺失/为 0 时保持原样（不把"没有时间"伪装成"刚刚"）', () => {
+  assert.deepEqual(compactModelMessage({ text: '好', time: 0 }, { now: NOW }), { text: '好', time: 0 });
+  assert.deepEqual(compactModelMessage({ text: '好' }, { now: NOW }), { text: '好' });
+});
+
+await test('一次序列化共用一个 now：同批消息的 ago 不会跨分钟自相矛盾', () => {
+  const data = {
+    messages: [
+      { seq: 1, text: 'a', time: NOW - 70 * 1000 },
+      { seq: 2, text: 'b', time: NOW - 10 * 1000 }
+    ]
+  };
+  const out = JSON.parse(serializeModelData(data, { now: NOW }));
+  assert.equal(out.messages[0].ago, '1m');
+  assert.equal(out.messages[1].ago, '10s');
+  // compactModelData 也要把 now 透传下去
+  assert.equal(compactModelData(data, { now: NOW }).messages[1].ago, '10s');
+});
+
+// ── 2. 唤醒提示：时间感规则 + 具体数字 ─────────────────────────────────────
+async function withBridge(run, config = {}) {
+  const h = await bridgeHarness({ config: { socialV2: { sticker: { enabled: false }, ...config } } });
+  h.setMode('reserved2');
+  try { await run(h); } finally { await h.close(); }
+}
+
+const append = (h, text, { ageMs = 0, sender = '小明' } = {}) => {
+  const st = h.getSocialV2State(KEY);
+  const seq = st.lastUnreadSeq + 1;
+  h.appendSocialV2Message(KEY, sender, text, text, false, false, `fixture-${seq}`, [], '789');
+  if (ageMs > 0) {
+    // 模拟"消息是 40 分钟前发的"：把存储层的时间戳往前推（模拟沉睡期间堆积）
+    const stored = st.unread.find((m) => m.seq === seq);
+    if (stored) stored.time = Date.now() - ageMs;
+  }
+  return seq;
+};
+
+// 2026-10-31：分档规则搬进 persona（系统提示词，常驻且可缓存）之后，唤醒提示词里
+// 不再有【时间感】段落 —— 每轮重复 350 字既贵又迟早与 persona 漂移。现在提示词的
+// 唯一时间信号是快照里每条消息的 `at`（绝对时间）+ `ago`（多久前），分档判断交给
+// persona 的【时间感：先看消息多旧，再决定怎么开口】。
+// 下面几条因此改盯**快照渲染**，而不是已经消失的提示词段落。
+await test('新消息（几秒前）：快照里标着刚发的，不是旧账', async () => {
+  await withBridge(async (h) => {
+    append(h, '在吗');
+    const rendered = h.renderWakeSnapshotV2(h.buildWakeSnapshotV2(KEY));
+    assert.match(rendered, /小明（未点名）·\d+秒前：在吗/, `新消息该标秒级：\n${rendered}`);
+  });
+});
+
+await test('40 分钟前的消息：快照给出「40分钟前」，模型不必自己换算', async () => {
+  await withBridge(async (h) => {
+    append(h, '晚上开黑吗', { ageMs: 40 * MIN });
+    const snapshot = h.buildWakeSnapshotV2(KEY);
+    assert.equal(snapshot.newestAgo, '40m', '最新一条的年龄要写进快照头');
+    const rendered = h.renderWakeSnapshotV2(snapshot);
+    assert.match(rendered, /40分钟前：晚上开黑吗/, `年龄要渲染成中文：\n${rendered}`);
+  });
+});
+
+await test('5 小时前的消息：快照标「5小时前」，跨天 at 带日期', async () => {
+  await withBridge(async (h) => {
+    append(h, '有人吗', { ageMs: 5 * 60 * MIN });
+    const snapshot = h.buildWakeSnapshotV2(KEY);
+    assert.equal(snapshot.newestAgo, '5h');
+    const rendered = h.renderWakeSnapshotV2(snapshot);
+    assert.match(rendered, /5小时前：有人吗/, `小时级要渲染对：\n${rendered}`);
+    // at 是绝对时间；跨天必须带 MM-DD，否则"23:40"会被误读成今天。
+    assert.match(snapshot.messages[0].at, /^\d{2}:\d{2}$|^\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+});
+
+await test('提示词不再重复分档规则（已搬进 persona，避免两处漂移）', async () => {
+  await withBridge(async (h) => {
+    append(h, '刚刚那条', { ageMs: 12 * MIN });
+    const prompt = h.buildWakePromptV2(KEY, 'atMention@seq1');
+    assert.doesNotMatch(prompt, /【时间感/, '分档规则在 persona 里，提示词不该再抄一份');
+    assert.doesNotMatch(prompt, /旧账/, '旧的「旧账」措辞不该再出现');
+    assert.doesNotMatch(prompt, /超过 120 分钟/, '阈值文案不该再进提示词');
+  });
+});
+
+await test('定时/引导唤醒也不带分档规则（没有可判断的消息时）', async () => {
+  await withBridge(async (h) => {
+    const prompt = h.buildWakePromptV2(KEY, 'bootstrap');
+    assert.doesNotMatch(prompt, /【时间感/, '没有消息时不该注入分档规则');
+  });
+});
+
+// ── 3. 唤醒快照：now / newestAgo / 每条 at-ago ─────────────────────────────
+await test('快照头部带 now 与 newestAgo，消息体带 at/ago 且不再有裸 time', async () => {
+  await withBridge(async (h) => {
+    append(h, '第一条');
+    append(h, '第二条', { ageMs: 25 * MIN });
+    const snapshot = h.buildWakeSnapshotV2(KEY);
+    assert.match(snapshot.now, /^\d{2}:\d{2}$/);
+    assert.equal(snapshot.newestAgo, '25m');
+    for (const message of snapshot.messages) {
+      assert.equal(message.time, undefined, '快照里不该再有裸 epoch');
+      // at 当天只给 HH:MM，跨天补 MM-DD（否则"23:40"会被读成今天）。
+      assert.match(message.at, /^\d{2}:\d{2}$|^\d{2}-\d{2} \d{2}:\d{2}$/);
+      assert.match(message.ago, /^\d+[smhd]$/);
+    }
+    assert.equal(snapshot.messages[1].ago, '25m');
+  });
+});
+
+// ── 4. 工具结果也走同一套视图（MCP 与桥接共用 qq-model-view） ───────────────
+await test('serializeModelData 对 messages/newMessages 同时生效（工具结果同口径）', () => {
+  const data = { ok: true, unreadCount: 1, messages: [{ seq: 3, text: 'x', time: NOW - 90 * 1000 }], newMessages: [{ seq: 4, text: 'y', time: NOW - 5 * MIN }] };
+  const out = JSON.parse(serializeModelData(data, { now: NOW }));
+  assert.equal(out.messages[0].ago, '1m');
+  assert.equal(out.newMessages[0].ago, '5m');
+  assert.equal(out.unreadCount, 1, '信封字段不受影响');
+});
+
+console.log(`\n${failures ? 'FAILED' : 'ALL PASS'}  tests=${tests} failures=${failures}`);
+if (failures) process.exit(1);
