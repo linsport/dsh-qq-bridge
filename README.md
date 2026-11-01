@@ -92,8 +92,17 @@ cp config.example.json config.json      # Windows CMD 用：copy config.example.
 ### 2. 装 DSH 端（preset + MCP），然后重启 DSH
 
 ```bash
-node scripts/setup-dsh.mjs
+node scripts/install-desktop-profile.mjs desktop
 ```
+
+仓库里有两个安装脚本，**装进桌面版 DSH 用这个**：
+
+| 脚本 | 装哪 | 怎么改配置 |
+|---|---|---|
+| `install-desktop-profile.mjs [profile]` | 已有 profile，默认 `desktop` | 纯追加：建 junction、`package.json` 加 `link:` 依赖、`cordis.patch.yml` 末尾**文本追加** MCP 条目（带 `# === qq-bridge MCP BEGIN/END ===` 标记），**不解析重写** |
+| `setup-dsh.mjs [profile]` | 新建/干净的 profile，默认 `web`（即 `dsh --profile web` 那套） | 用 `js-yaml` 把整个 `cordis.patch.yml` load → 改 → dump |
+
+> 桌面版**必须**用前者，两个原因：一是 desktop 的 `cordis.patch.yml` 里带 `!!js process.platform === 'win32'` 这类自定义标签，`js-yaml` 会抛 `unknown tag !<tag:yaml.org,2002:js>` 直接 fatal 退出（文件一个字不动，看起来像"跑完了但没效果"）；退一步说，就算能解析，dump 回来也会把注释和自定义标签一起洗掉。二是 `setup-dsh.mjs` 默认 profile 是 `web`，桌面版机器上通常根本没有这个目录。
 
 装完**必须重启 DSH** —— preset 与 MCP 只在 DSH 启动时加载。跳过这步桥接不会崩，但群聊会话拿不到 `qq-chat` preset，桥接会**拒绝建会话**（有意的安全设计：绝不回退到带 bash / 文件工具的默认 preset），表现是 QQ 上毫无反应。
 
@@ -130,18 +139,23 @@ node scripts/setup-dsh.mjs
 
 ### 5. 启动
 
-```bash
-npm start          # 前台运行
-```
+桥接只有这几种启动方式，没有开机自启、没有服务化，每次开机要自己点一下：
 
-Windows 想要崩溃自动重启就用 `start.bat`（守护模式，窗口别关）。看到 `SnowLuma 已连接` 即成功，然后从 QQ 给机器人账号发条消息测试。
+| 方式 | 怎么做 | 说明 |
+|---|---|---|
+| **守护模式（推荐日常用）** | 双击 `start.bat` | 崩溃 5 秒后自动重启，窗口别关。启动前会先跑一次 `state/` 权限加固（拿不到权限只打印提示，不阻断启动） |
+| 前台 | `npm start` | 关窗口即停，适合调试看日志 |
+| 重启 | 双击 `restart.bat` | 杀旧实例 → 清锁 → 重新拉起守护 |
+| 重启（不切桌面） | 控制台点「重启」 | 先把状态落盘再退出；**守护模式下** `start.bat` 会在 5 秒后自动拉起，`npm start` 前台模式则就此停掉 |
+
+看到 `SnowLuma 已连接` 即成功，然后从 QQ 给机器人账号发条消息测试。
 
 > 首次连接大概率会先失败一次（`code=1006`），随后自愈 WS token 并连上 —— 这条序列是正常的。
 
 ### 6. 出事怎么办
 
-- 消息没反应：先双击 `restart.bat`（杀旧实例 → 清锁 → 重启守护）
-- 桥接只能跑一个实例（有单实例锁）
+- 消息没反应：先重启（双击 `restart.bat`，或控制台点「重启」）
+- 桥接只能跑一个实例（有单实例锁）—— `start.bat` 发现已在跑会直接退出并提示，不会起第二个
 - 改了 `config.json` / `roles/` / `state/current-role.json` → 重启桥接；改了 `dsh/agent-presets/` → 先跑 `node scripts/build-agent-preset-patches.mjs`，再重启 DSH
 
 ## 其余文档
