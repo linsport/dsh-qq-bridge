@@ -125,6 +125,10 @@ const tests = [
   'test-reply-target.mjs',
   // 合并窗口的按会话覆盖：覆盖值要优先于全局、要落盘、0 要能表达「不覆盖」。
   'test-batch-window.mjs',
+  // 梗百科查询的网络出口：代理端口绝不写死、只认回环代理、NO_PROXY 三写法、
+  // 显式出口不许被偷偷切走，以及**对外错误文案里不许出现本机地址**（那些字会进
+  // 模型上下文，群里人格明写禁止泄露本机信息）。全程离线，不连 cnmeme 也不连代理。
+  'test-meme-wiki.mjs',
 ];
 let failed = 0;
 for (const test of tests) {

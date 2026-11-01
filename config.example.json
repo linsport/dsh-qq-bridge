@@ -335,5 +335,14 @@
     "maxTokens": 4096,
     "maxResults": 8,
     "timeoutMs": 35000
+  },
+  "netExit": {
+    "proxy": "auto"
+  },
+  "memeWiki": {
+    "enabled": true,
+    "proxy": "auto",
+    "timeoutMs": 12000,
+    "maxChars": 2000
   }
 }

@@ -60,7 +60,7 @@ const KEY = 'group:456';
 
 const BUILTIN_HEAD = '【醒来先过三关】';
 const BUILTIN_TIME = '超 120 分钟默认不接';
-const BUILTIN_TARGET = '接话之前先把这一段读懂';
+const BUILTIN_TARGET = '看对象：不要单纯依赖@标记';
 
 await test('没配过时给的是内置默认，不是空', () => {
   const line = h.wakeCheckLineV2();
@@ -96,7 +96,9 @@ await test('清空之后唤醒包整体少一段，不是多一行空行', () =>
 await test('配置回到内置原文时，唤醒包里原样出现（含 ** 加粗）', () => {
   delete h.cfg.socialV2.context.wakeCheckPrompt; // 模拟老配置：键根本不存在
   const prompt = h.buildWakePromptV2(KEY, 'atMention');
-  assert.ok(prompt.includes('看**最新那条和叫你的那条**一起判'), '内置文案里的加粗要原样保留');
+  // 内置文案本身现在不带 ** 了（user message 里不渲染），这里改成钉一句正文；
+  // 至于「配的 ** 原样透传」由上面第 73 行那条用例负责，别混在一起。
+  assert.ok(prompt.includes('看最新那条和叫你的那条一起判'), '内置文案正文应原样进入唤醒包');
 });
 
 // 走真实的保存路径：超长文本必须在写盘前截断，否则每轮的包会被一篇长文撑爆。

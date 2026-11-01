@@ -194,3 +194,37 @@ test('invalid resource limits are rejected before network access', async (t) => 
     await assert.rejects(safeFetchBuffer('http://93.184.216.34/', limit), /正整数/);
   }
 });
+
+// 出口（代理）选择只对显式传 `options.proxy` 的调用方生效。
+//
+// 这一组守的是「别把别的调用方一起拖下水」：本文件其它用例、QQ 图片 CDN、Bing 搜索
+// 都是直连可达的，如果 safeFetch 默认去读 HTTPS_PROXY，用户机器上一个顺手设的环境变量
+// 就能把它们全部弄坏。
+test('safeFetch defaults to direct and ignores proxy env vars', async (t) => {
+  const saved = { HTTPS_PROXY: process.env.HTTPS_PROXY, ALL_PROXY: process.env.ALL_PROXY, NO_PROXY: process.env.NO_PROXY };
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:7897';
+  process.env.ALL_PROXY = 'socks5://127.0.0.1:1080';
+  try {
+    const { requests } = mockTransport(t, [{ body: 'direct' }]);
+    const result = await safeFetch('https://public.test/');
+    assert.equal(result.body, 'direct');
+    assert.equal(requests.length, 1);
+    // 直连路径的特征：直接把已校验的 IP 当 hostname，不注入 createConnection。
+    assert.equal(requests[0].options.hostname, '93.184.216.34');
+    assert.equal(requests[0].options.createConnection, undefined);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('safeFetch rejects a non-loopback proxy before opening any connection', async (t) => {
+  const { requests } = mockTransport(t, []);
+  for (const proxy of ['http://10.0.0.1:8080', 'socks5://proxy.example.com:1080', 'https://127.0.0.1:443']) {
+    // 非回环代理 = 把内网探测通道交出去；https:// 代理未实现。两者都必须抛出，不能静默改直连。
+    await assert.rejects(safeFetch('https://public.test/', 1000, { proxy }), /代理/);
+  }
+  assert.equal(requests.length, 0);
+});

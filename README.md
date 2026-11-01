@@ -52,6 +52,15 @@
 - `src/media-items.js`：一项真图都没拿到就判失败（原来回 `ok:true` 加一句说明，模型以为自己看过了）
 - ffmpeg 失败时保留现场（最近 5 次），并对 `-5 / EIO` 重试一次
 
+**联网工具**
+
+- `mcp__web-search-safe__meme_lookup`：查 [梗百科](https://cnmeme.wiki) 的公开词条（梗名 → 出处 / 用法）。`auto` 模式下搜到同名 slug 就直接取详情，否则列候选。内容是第三方文本，只作资料读。
+- **出口选择**（`src/net-exit.js` + `src/proxy-tunnel.js`）：代理端口绝不写死，`netExit.proxy` 取 `auto`（读 `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`）/ `off` / 显式 URL；`http://` 走 CONNECT、`socks5://` 走 RFC1928，都是手写的，没加依赖。
+  - 代理只接受回环地址，写别的直接抛错、不静默降级 —— 否则它就成了内网探测通道。
+  - 目标校验仍然先做：代理开着也拦内网/本机地址，CONNECT 打的是已校验的 IP 而不是域名（DNS 交给代理解析的话，那一步校验就白做了）。
+  - 出口建连失败对外只说「网络出口暂时不可用」，本机端口只进 `state/meme-wiki.log` —— 工具返回会进模型上下文，群里人格明写禁止透露本机信息。
+  - `web_fetch` 也接了出口选择；`safeFetchBuffer`（QQ 图片/表情 CDN）与 Bing 搜索仍走直连，它们国内可达，塞代理反而坏事。
+
 **配置与控制台**
 
 - `socialV2` 的 `wake` / `context` 段补深度合并 —— config.json 里写了这两段但缺新键时，新键原来会静默变成 `undefined`
@@ -59,7 +68,7 @@
 
 **测试**
 
-- `npm run test:audit` 从 38 条扩到 **56 条**，新增 18 个回归脚本。每条新用例都做过**回退验证** —— 把改动撤回去它必须真的红。
+- `npm run test:audit` 从 38 条扩到 **57 条**，新增 19 个回归脚本。每条新用例都做过**回退验证** —— 把改动撤回去它必须真的红。
 
 逐版说明见 [Releases](https://github.com/linsport/dsh-qq-bridge/releases) 与 git tag 的附注。
 
