@@ -74,7 +74,7 @@
 
 ## 前置条件
 
-1. 运行中的 DeepSeek Harness Web（默认 `http://127.0.0.1:3080`）
+1. 运行中的 DeepSeek Harness Web（端口不固定：桌面版每次启动由系统分配空闲端口，`dsh --profile web` 才固定回落到 3080。桥接连不上会自动扫描本机回环端口找回来，`config.json` 里的 `dsh.baseUrl` 只是个起点）
 2. 运行中的 SnowLuma，且配好 OneBot WebSocket 与 HTTP API（默认 `ws://127.0.0.1:3001` / `http://127.0.0.1:3000`）
 3. Node.js ≥ 22.13
 
@@ -122,6 +122,7 @@ node scripts/setup-dsh.mjs
 }
 ```
 
+- `dsh.baseUrl` 端口对不上不要紧：桥接启动时会探活，探不到就扫本机回环端口，把活的 DSH 认出来（只认返回 401 + `dsh web authentication required` 的，不会认错成别的服务），然后写回 `config.json`。
 - `wsUrl` 是 WebSocket 端口，`httpUrl` 是 HTTP API 端口 —— **不要填成同一个**，否则工具会报 HTTP 426。
 - `dsh.authToken` **通常留空**：留空时桥接用 `~/.dsh/.credentials.yaml` 里的签名密钥离线铸造 Cookie。
 - 示例模板里白名单是空数组，空白名单 + `allowAllWhenEmpty: false` 时桥接不响应任何消息（刻意的 fail-closed 默认值）。
