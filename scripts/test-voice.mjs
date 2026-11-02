@@ -158,7 +158,7 @@ console.log('## MCP 工具与 bridge 路由');
   ]) {
     ok(bridge.includes(s), `bridge 包含 ${s}`);
   }
-  ok(bridge.includes("v2ToolEnabled('sendVoice')"), 'send-voice 路由受 sendVoice 开关控制');
+  ok(/v2ToolEnabled\('sendVoice',\s*key\)/.test(bridge), 'send-voice 路由受 sendVoice 开关控制（会话级开关后必须带 key，否则会话覆盖不生效）');
   ok(/resolveVoicePathForV2[\s\S]{0,1200}allowAbsolutePath/.test(bridge), 'AI 通道绝对路径受 allowAbsolutePath 约束');
 }
 

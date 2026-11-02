@@ -173,6 +173,14 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     // 三档权限分级：档位判定与「该用哪个 preset」都暴露出来，方便直接断言（不必真建会话）。
     sessionTier, wantedPresetName, isAllowListed, TIER_PRESETS, modePreset,
+    // 会话级 preset 覆盖：可选项是写死的四个 qq-chat*，必须能断言"填 standard 会被拒"——
+    // 那是这个功能唯一可能造成提权的地方，不钉住就等于没做。
+    SESSION_PRESET_CHOICES, isSessionPresetChoice, readSessionPresets, writeSessionPreset,
+    sessionPresetOverride, CLEAR_SESSION_PRESET,
+    // 会话级 MCP 工具开关：只能卡在调用期（MCP 服务一个进程只有一份工具表），
+    // 所以这里要能断言「同一 flag 在不同 key 上给出不同答案」。
+    readSessionTools, writeSessionTool, sessionToolOverride, isV2ToolFlag, CLEAR_SESSION_TOOL,
+    v2ToolEnabled,
     collectors, setupSleepTimerV2,
     getInitialPrompt, setInitialPrompt, loadInitialPrompts, formatInitialPromptV2,
     initialPrompts, initialPromptMaxChars,

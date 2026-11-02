@@ -35,33 +35,64 @@ async function loadPlugin(diagFile) {
   return mod;
 }
 
-function makeCtx({ restrictImpl, knownAfter = Infinity }) {
-  const calls = { restrict: [], guard: null, hidden: new Set() };
-  let round = 0;
+/**
+ * 造一个**语义上忠实于 DSH** 的 ctx.tools 桩。
+ *
+ * 2026-11-02 重写：以前的桩对任何名字都照单全收（除非 restrictImpl 硬造 Error），
+ * 于是「82 个名字逐个 deny」看起来全都成功。真实 DSH 的行为是：
+ *   · 只认全局层里**确实注册过**的名字；
+ *   · 名字不在其中 ⇒ 整批抛错，报错尾巴附完整 `known global tools:` 清单；
+ *   · deny 掉的名字从 `visible` 消失（= 不再进模型 schema）；
+ *   · 白名单（allow）写法必须名字也都存在，作用一样。
+ * 不模拟这一条，就测不出「77 个名字在空转」这类问题。
+ * @param {{known?: string[], knownAfterRounds?: number}} options
+ */
+function makeCtx({ known = [], knownAfterRounds = Infinity, reportKnown = true } = {}) {
+  const calls = { restrict: [], guard: null, hidden: new Set(), rounds: 0 };
+  // `known` 是「这个 composition 最终会注册的名字」；`knownAfterRounds` 之前它们还**没**进全局层，
+  // 用来模拟注入器晚注册。默认 Infinity ⇒ 一开始就全在。
+  const registered = new Set(knownAfterRounds === Infinity ? known : []);
   const ctx = {
     tools: {
       restrict(filter) {
-        const name = filter?.deny?.[0];
-        calls.restrict.push(name);
-        round += 1;
-        const result = restrictImpl({ name, round });
-        if (result instanceof Error) throw result;
-        calls.hidden.add(name);
+        calls.rounds += 1;
+        if (calls.rounds > knownAfterRounds) for (const name of known) registered.add(name);
+        const names = [...(filter?.allow ?? []), ...(filter?.deny ?? [])];
+        calls.restrict.push(...names);
+        const unknown = names.filter((name) => !registered.has(name));
+        if (unknown.length > 0) {
+          // reportKnown=false 模拟「未来 DSH 不再在报错里附清单」——探测失效，须退回逐个 deny
+          const suffix = reportKnown ? `; known global tools: ${[...registered].sort().join(', ') || '(none)'}` : ';';
+          throw new Error(
+            `tools.restrict() names unknown global tool${unknown.length > 1 ? 's' : ''} ` +
+            `${unknown.map((name) => `"${name}"`).join(', ')}${suffix}`
+          );
+        }
+        for (const name of filter?.deny ?? []) calls.hidden.add(name);
         return () => {};
       },
       guard(fn) { calls.guard = fn; }
     }
   };
-  return { ctx, calls, knownAfter };
+  return { ctx, calls };
 }
+
+/** 本机实测的一份全局层清单（2026-11-02，`state/tool-restrict.log` 里 DSH 自己报的）。 */
+const REAL_GLOBAL_TOOLS = [
+  'advanced_search', 'cache_search', 'domain_search', 'free_search_test',
+  'list_mcp_resource_templates', 'list_mcp_resources', 'load_workspace_dependencies',
+  'acp_cache', 'acp_status', 'compress', 'decompress', 'search_context',
+  'bsk_assist', 'bsk_page', 'mnemon_recall', 'mnemon_remember',
+  'mcp__snowluma__qq_send_message', 'mcp__web-search-safe__web_search',
+];
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-tool-restrict-'));
 
-await test('restrict 全失败时不静默：写诊断文件 + 3 秒后重试', async () => {
+await test('探测不到全局清单时退回逐个 deny：不静默，写诊断 + 3 秒后重试', async () => {
   const diag = path.join(tmpDir, 'diag-always-fail.log');
   const mod = await loadPlugin(diag);
-  // 前 N 次（第一次 apply 的所有名字）都报「unknown global tool」，重试阶段也失败
-  const { ctx, calls } = makeCtx({ restrictImpl: () => new Error('tools.restrict() names unknown global tool "x"') });
+  // reportKnown=false：模拟未来 DSH 不再在报错里附清单 ⇒ 探测拿不到真实表，走旧路径
+  const { ctx, calls } = makeCtx({ known: [], reportKnown: false });
   mod.apply(ctx);
   assert.ok(calls.restrict.length > 0, '必须真的调用 restrict');
   const first = fs.readFileSync(diag, 'utf8');
@@ -80,10 +111,9 @@ await test('时序问题能被 3 秒后的重试补藏（工具晚注册）', as
   const diag = path.join(tmpDir, 'diag-late.log');
   const mod = await loadPlugin(diag);
   const total = mod.RESTRICTED_TOOL_NAMES.length;
-  // 第一轮全部失败（模拟全局工具还没注册），第二轮全部成功（模拟 3 秒后注入器已注册）
-  const { ctx, calls } = makeCtx({
-    restrictImpl: ({ round }) => (round <= total ? new Error('unknown global tool') : undefined)
-  });
+  // 轮次账：探测占 1 轮 + 逐个 deny 占 total 轮 = total+1 轮；之后再注册即为「晚到」，
+  // 由 3 秒后的重试补藏。
+  const { ctx, calls } = makeCtx({ known: mod.RESTRICTED_TOOL_NAMES, knownAfterRounds: total + 1, reportKnown: false });
   mod.apply(ctx);
   assert.equal(calls.hidden.size, 0, '第一轮应当一个都没藏掉');
   await new Promise((resolve) => setTimeout(resolve, 3400));
@@ -92,19 +122,68 @@ await test('时序问题能被 3 秒后的重试补藏（工具晚注册）', as
   assert.match(log, new RegExp(`延迟重试 ok=${total}`), `重试结果应写入诊断：${log}`);
 });
 
+// ── 新路径：从 DSH 报错里抠出真实全局表，改按 allow 收敛（2026-11-02） ──────
+//
+// 这是本轮的核心修复。以前的实现拿 82 个名字逐个 deny，在本机实测只有 4 个存在，
+// 剩下 78 个全抛 unknown 跳过 —— 而真正在全局层里的 acp_* / bsk_* / mnemon_* /
+// advanced_search 一个都没挡，它们在会话 schema 里照样可见、模型反复试、反复被拒。
+await test('按真实全局表收敛：只留白名单，其余全部从 schema 隐藏', async () => {
+  const diag = path.join(tmpDir, 'diag-allow.log');
+  const mod = await loadPlugin(diag);
+  const { ctx, calls } = makeCtx({ known: REAL_GLOBAL_TOOLS });
+  mod.apply(ctx);
+  // 白名单里的必须活着
+  for (const name of ['mcp__snowluma__qq_send_message', 'mcp__web-search-safe__web_search']) {
+    assert.ok(!calls.hidden.has(name), `${name} 必须保留（属于放行命名空间）`);
+  }
+  // 其余全部藏掉 —— 包括以前名单里根本没有的那些
+  for (const name of ['acp_cache', 'bsk_assist', 'mnemon_recall', 'advanced_search', 'compress', 'search_context']) {
+    assert.ok(calls.hidden.has(name), `${name} 必须从 schema 隐藏`);
+  }
+  const log = fs.readFileSync(diag, 'utf8');
+  assert.match(log, /restrict 全局层实测 \d+ 个：隐藏 \d+ 个、保留 2 个/, `诊断应记录实测收敛结果：${log}`);
+  // 收敛后不该再有「逐个试 82 个」的跳过噪声
+  assert.doesNotMatch(log, /skipped=\d+/, '探测成功时不应再走逐个 deny 的旧路径');
+});
+
+await test('全局层里出现名单外的危险名：被 allow 收敛藏掉，并在 console 提示更新名单', async () => {
+  const diag = path.join(tmpDir, 'diag-unknown-danger.log');
+  const mod = await loadPlugin(diag);
+  const { ctx, calls } = makeCtx({ known: [...REAL_GLOBAL_TOOLS, 'brand_new_private_tool'] });
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => { errors.push(args.join(' ')); };
+  try { mod.apply(ctx); } finally { console.error = originalError; }
+  assert.ok(calls.hidden.has('brand_new_private_tool'), '名单外的名字也必须被藏掉（allow 收敛兜底）');
+  assert.ok(errors.some((line) => /不在已知名单里/.test(line)), `应提示更新名单：${errors.join(' | ')}`);
+});
+
+await test('parseKnownGlobalTools / probeKnownGlobalTools 的边界', async () => {
+  const mod = await loadPlugin(path.join(tmpDir, 'diag-parse.log'));
+  // (none) 当空集，不是当一个名字
+  assert.deepEqual(mod.parseKnownGlobalTools('x; known global tools: (none)'), []);
+  assert.deepEqual(mod.parseKnownGlobalTools('x; known global tools:'), []);
+  assert.deepEqual(mod.parseKnownGlobalTools('x; known global tools: a, b, c'), ['a', 'b', 'c']);
+  // 没有清单尾巴 → undefined（调用方退回旧行为）
+  assert.equal(mod.parseKnownGlobalTools('unknown global tool "a";'), undefined);
+  // 探测：restrict 不抛错（未来放宽）时返回 undefined
+  assert.equal(mod.probeKnownGlobalTools(() => undefined), undefined);
+});
+
 await test('restrict 一次成功时不写诊断文件（不制造噪声）', async () => {
   const diag = path.join(tmpDir, 'diag-ok.log');
   const mod = await loadPlugin(diag);
-  const { ctx, calls } = makeCtx({ restrictImpl: () => undefined });
+  // 全局层只有白名单工具 ⇒ 无需隐藏，也就不该打诊断
+  const { ctx, calls } = makeCtx({ known: ['mcp__snowluma__qq_send_message', 'ask_user_question'] });
   mod.apply(ctx);
-  assert.equal(calls.hidden.size, mod.RESTRICTED_TOOL_NAMES.length);
-  assert.equal(fs.existsSync(diag), false, '全部成功时不该产生诊断文件');
+  assert.equal(calls.hidden.size, 0, '全是白名单时应一个都不藏');
+  assert.equal(fs.existsSync(diag), false, '无事可做时不该产生诊断文件');
 });
 
 await test('执行期 guard 照旧：QQ MCP 放行、dev_* 与本地工具拒绝', async () => {
   const diag = path.join(tmpDir, 'diag-guard.log');
   const mod = await loadPlugin(diag);
-  const { ctx, calls } = makeCtx({ restrictImpl: () => undefined });
+  const { ctx, calls } = makeCtx({ known: REAL_GLOBAL_TOOLS });
   mod.apply(ctx);
   assert.equal(typeof calls.guard, 'function', '必须注册执行期 guard');
   const guard = calls.guard;
@@ -179,7 +258,7 @@ await test('apply 真的按行级 config.mode 建 guard（open / readonly / 未�
   const diag = path.join(tmpDir, 'diag-mode-apply.log');
   const mod = await loadPlugin(diag);
   const build = (config) => {
-    const { ctx, calls } = makeCtx({ restrictImpl: () => undefined });
+    const { ctx, calls } = makeCtx({ known: REAL_GLOBAL_TOOLS });
     mod.apply(ctx, config);
     return calls;
   };
@@ -200,9 +279,15 @@ await test('apply 真的按行级 config.mode 建 guard（open / readonly / 未�
     assert.ok(strict.guard({ name: 'read' }), `${JSON.stringify(config)} 必须按 strict 处理`);
     assert.equal(strict.guard({ name: 'mcp__snowluma__qq_send_message' }), undefined);
   }
-  // 三档共用同一份注册期隐藏名单：open 也要把 dev_* 从 schema 里藏掉
-  assert.equal(open.hidden.size, mod.RESTRICTED_TOOL_NAMES.length, 'open 档同样要跑完整 restrict 名单');
-  assert.ok(open.hidden.has('dev_inject_plugin') && open.hidden.has('working_directory'));
+  // 三档共用同一份收敛结果：open 也要把非白名单工具从 schema 里藏掉
+  // （2026-11-02：判据从「藏满 82 个名单」改成「全局层里非白名单的一个不剩」，
+  //  因为旧的 82 个里绝大多数在本机根本不存在，数它们只会掩盖真正没挡住的名字。）
+  const nonWhitelisted = REAL_GLOBAL_TOOLS.filter(
+    (name) => !name.startsWith('mcp__') && name !== 'ask_user_question' && name !== 'todo_write'
+  );
+  for (const name of nonWhitelisted) {
+    assert.ok(open.hidden.has(name), `open 档也要藏掉 ${name}`);
+  }
 });
 
 fs.rmSync(tmpDir, { recursive: true, force: true });

@@ -79,6 +79,12 @@ function getArtifacts() {
 }
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
+// 会话级 preset 档位覆盖（见 readSessionPresets）。
+// 单独一个文件而不是塞进 social-v2.json：它属于操作者的权限配置，
+// 不能跟着会话状态被重置清掉（同 INITIAL_PROMPTS_FILE 的理由）。
+const SESSION_PRESET_FILE = path.join(STATE_DIR, 'session-presets.json');
+// 会话级 MCP 工具开关（见 readSessionTools）。同样单独一个文件，理由同上。
+const SESSION_TOOLS_FILE = path.join(STATE_DIR, 'session-tools.json');
 const SLANG_FILE = path.join(STATE_DIR, 'slang.json');
 const SLANG_SESSION_FILE = path.join(STATE_DIR, 'slang-session.json');
 const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
@@ -1007,6 +1013,172 @@ function roleSourceForKey(key, rs = readRoleState()) {
 }
 function sanitizeRoleName(name) {
   return String(name ?? '').replace(/[^\w\u4e00-\u9fff-]/g, '');
+}
+
+// ── 会话级 preset 档位覆盖（2026-11-02） ─────────────────────────────────────
+//
+// 三档分级（owner / readonly / chat）是按"这个会话是谁"自动定的，操作者没有插手余地。
+// 这里补一层：**允许操作者给单个会话换一个档位**，形状照抄上面的人格覆盖
+// （state/current-role.json 的 sessionRoles），语义也一样：
+//   键不存在 = 没设过，跟着档位默认走
+//   字符串   = 这个会话就用这个 preset
+//
+// ⚠️ 可选项是**写死的四个 qq-chat\***，不是"DSH 里有什么就能填什么"。
+//   一旦允许任意名字，操作者手滑填 standard 就等于把 bash/文件读写交给群友
+//   （standard 是 DSH 默认 preset，含本地工具）—— 那正是三档分级 fail-closed 要防的事。
+//   少一点灵活性，换"填错也提不了权"。
+const SESSION_PRESET_CHOICES = Object.freeze(['qq-chat', 'qq-chat-v2', 'qq-chat-readonly', 'qq-chat-owner']);
+// 与 CLEAR_SESSION_ROLE 同理：patch 里传这个 Symbol 表示把键删掉，回落到档位默认。
+const CLEAR_SESSION_PRESET = Symbol('clearSessionPreset');
+// 会话级工具覆盖的「删掉这一条」，语义同上。
+const CLEAR_SESSION_TOOL = Symbol('clearSessionTool');
+
+/** 一个 preset 名是否允许被会话级覆盖选中（见 SESSION_PRESET_CHOICES）。 */
+function isSessionPresetChoice(name) {
+  return SESSION_PRESET_CHOICES.includes(String(name ?? '').trim());
+}
+
+function readSessionPresets() {
+  const raw = readJsonSafe(SESSION_PRESET_FILE, {});
+  const out = Object.create(null);
+  const bag = raw?.sessionPresets;
+  if (!bag || typeof bag !== 'object' || Array.isArray(bag)) return out;
+  for (const [k, v] of Object.entries(bag)) {
+    const key = canonicalV2Key(k);
+    if (!key) continue;
+    // 认不出来的值直接丢掉（而不是当"没设过"之外的第三种状态）：
+    // 手改过 state 文件、或以后改了可选清单，旧值都不该继续生效。
+    if (!isSessionPresetChoice(v)) continue;
+    out[key] = String(v).trim();
+  }
+  return out;
+}
+
+/** 改一个会话的 preset 覆盖；preset 传 CLEAR_SESSION_PRESET 表示删除该条。 */
+function writeSessionPreset(key, preset) {
+  const cur = readSessionPresets();
+  const next = { sessionPresets: { ...cur } };
+  const canonical = canonicalV2Key(key);
+  if (!canonical) throw new Error('会话 key 必须是 group:群号 或 private:QQ号');
+  if (preset === CLEAR_SESSION_PRESET) {
+    delete next.sessionPresets[canonical];
+  } else {
+    if (!isSessionPresetChoice(preset)) {
+      throw new Error(`preset 必须是 ${SESSION_PRESET_CHOICES.join(' / ')} 之一（不接受任意 preset 名）`);
+    }
+    next.sessionPresets[canonical] = String(preset).trim();
+  }
+  atomicWriteJson(SESSION_PRESET_FILE, { version: 1, ...next });
+  return next.sessionPresets;
+}
+
+/** 某个会话的 preset 覆盖；undefined = 没设过（跟着档位默认走）。 */
+function sessionPresetOverride(key, bag = readSessionPresets()) {
+  // 查的时候也 canonical 一次：调用方可能拿到带前导零的 key（白名单、快照、手写的 URL），
+  // 不做归一化就会出现「写进去生效、换个写法就查不到」这种最难查的错。
+  const k = canonicalV2Key(key) ?? String(key ?? '');
+  return Object.prototype.hasOwnProperty.call(bag, k) ? bag[k] : undefined;
+}
+
+// ── 会话级 MCP 工具开关 ────────────────────────────────────────────────────
+//
+// 背景（为什么只能做成"调用期判定"）：`socialV2.tools` 的开关是 **MCP 服务启动时**
+// 决定要不要 `server.tool(...)` 注册的（见 src/mcp-snowluma-safe.js 的 TOOL_CONFIG_FLAGS）。
+// 一个 MCP 进程只有一份工具表，所有会话共用；所以"让这个群的 schema 里彻底看不到发表情"
+// 在现架构下**做不到** —— 除非每个会话起一个 MCP 进程（代价远大于收益）。
+//
+// 能落地的位置是桥接自己的路由：每个 MCP 工具最终都打成一次
+// `/api/socialV2/*` 请求，`v2ToolEnabled(flag, key)` 在这些请求上做判定。
+// 于是会话级粒度的语义是：
+//   · 关掉了 ⇒ 工具**仍出现在 schema 里**，但调用一律 403「工具未启用」；
+//   · 打开的  ⇒ 该会话可以调，即使全局开关是关的。
+// 这是有意的取舍：宁可让模型偶尔撞一次 403，也不为了"看不见"去复制 31 份 MCP 进程。
+//
+// 覆盖只对"当前确实存在于 cfg.socialV2.tools 里的 flag"生效（见
+// isV2ToolFlag），免得手改 state 文件塞进来一个永远不生效的键。
+// 缓存：{ mtime, value }，仅当 session-tools.json 的 mtime 变了才重新解析。
+const sessionToolsCache = { mtime: 0, value: Object.create(null) };
+function readSessionTools() {
+  // 带 mtime 缓存：本函数被 v2ToolEnabled 调用，闸门点有 50 多个、每轮唤醒都会走，
+  // 每次都 sync 读一个小 JSON 不划算。mtime 没变就直接用上次解析的结果。
+  // 拿不到 mtime（文件不存在/权限问题）就当作缓存失效，照常返回空表。
+  let mtime = 0;
+  try {
+    mtime = fs.statSync(SESSION_TOOLS_FILE).mtimeMs;
+  } catch {
+    mtime = 0;
+  }
+  // 0 表示"文件不存在/拿不到"，也参与缓存比对：文件后来出现时 mtime 必然 > 0，
+  // 会立刻穿缓存重读一次。
+  if (sessionToolsCache.mtime === mtime) return sessionToolsCache.value;
+  const raw = readJsonSafe(SESSION_TOOLS_FILE, {});
+  const out = Object.create(null);
+  const bag = raw?.sessionTools;
+  if (!bag || typeof bag !== 'object' || Array.isArray(bag)) {
+    sessionToolsCache.mtime = mtime;
+    sessionToolsCache.value = out;
+    return out;
+  }
+  for (const [k, v] of Object.entries(bag)) {
+    const key = canonicalV2Key(k);
+    if (!key) continue;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+    const picked = Object.create(null);
+    for (const [flag, on] of Object.entries(v)) {
+      if (typeof on === 'boolean') picked[flag] = on;
+    }
+    if (Object.keys(picked).length > 0) out[key] = picked;
+  }
+  sessionToolsCache.mtime = mtime;
+  sessionToolsCache.value = out;
+  return out;
+}
+
+/** 某次请求对应的会话 key；拿不到就返回空串（表示"只按全局开关走"）。 */
+function v2SessionKeyOf(value) {
+  const key = canonicalV2Key(value);
+  return key ?? '';
+}
+
+/**
+ * 一个 flag 是否是合法开关名（以 socialV2.tools 的现有键为准）。
+ * tools 由调用方传入：这段代码在 main() 之外（cfg 是 main() 里的局部变量），
+ * 直接引用 cfg 会在模块顶层抛 ReferenceError —— 踩过一次。
+ */
+function isV2ToolFlag(flag, tools) {
+  const table = tools ?? {};
+  return Object.prototype.hasOwnProperty.call(table, String(flag ?? ''));
+}
+
+/** 改一个会话的某个工具开关；enabled 传 CLEAR_SESSION_TOOL 表示删除该条覆盖。 */
+function writeSessionTool(key, flag, enabled, tools) {
+  const canonical = canonicalV2Key(key);
+  if (!canonical) throw new Error('会话 key 必须是 group:群号 或 private:QQ号');
+  if (!isV2ToolFlag(flag, tools)) throw new Error(`未知的工具开关：${String(flag ?? '')}`);
+  const cur = readSessionTools();
+  const next = { sessionTools: {} };
+  for (const [k, v] of Object.entries(cur)) next.sessionTools[k] = { ...v };
+  const row = { ...(next.sessionTools[canonical] ?? {}) };
+  if (enabled === CLEAR_SESSION_TOOL) {
+    delete row[flag];
+  } else if (typeof enabled !== 'boolean') {
+    throw new Error('工具开关只能是 true / false，或传 null 表示清除覆盖');
+  } else {
+    row[flag] = enabled;
+  }
+  if (Object.keys(row).length > 0) next.sessionTools[canonical] = row;
+  else delete next.sessionTools[canonical];
+  atomicWriteJson(SESSION_TOOLS_FILE, { version: 1, ...next });
+  // 立刻作废缓存：文件系统 mtime 精度有限，连续两次写入可能落在同一毫秒里，
+  // 光靠 mtime 比对会读到上一版。写入方主动把 mtime 清零最稳。
+  sessionToolsCache.mtime = 0;
+  return next.sessionTools;
+}
+
+/** 某个会话的整行工具覆盖（可能为 undefined）。 */
+function sessionToolOverride(key, bag = readSessionTools()) {
+  const k = canonicalV2Key(key) ?? String(key ?? '');
+  return Object.prototype.hasOwnProperty.call(bag, k) ? bag[k] : undefined;
 }
 
 // 管理员 QQ（ownerQQ）规范化：空值=未设置；必须是正整数 QQ 号。
@@ -3676,6 +3848,11 @@ async function main() {
    */
   function wantedPresetName(key, mode, cfg) {
     if (mode === 'closed-agent') return closedAgentPreset || '';
+    // 会话级覆盖压过档位默认（操作者在控制台指定的，见 writeSessionPreset）。
+    // 放在 closed-agent 之后：那个模式本来就只放行 owner 私聊、且要用完整工具面，
+    // 让它被一条遗留的覆盖改小是净损失，没有对应收益。
+    const override = sessionPresetOverride(key);
+    if (override) return override;
     const tier = sessionTier(key, mode, cfg);
     if (tier === 'owner') return TIER_PRESETS.OWNER;
     if (tier === 'readonly') return TIER_PRESETS.READONLY;
@@ -4102,7 +4279,14 @@ async function main() {
 
   // ── 本地控制台（独立 Web 面板，不依赖 DSH WebUI） ───────────────────────────
   // 模式/角色/静默状态都存 state/*.json，桥接即时感知；此服务只读写这些文件。
-  function v2ToolEnabled(flag) {
+  // 会话级开关：key 拿得到就先看这个会话的覆盖，拿不到（或这个 flag 没被覆盖过）
+  // 再退回全局开关。见 readSessionTools 上面那段注释。
+  function v2ToolEnabled(flag, key) {
+    const sessionKey = v2SessionKeyOf(key);
+    if (sessionKey) {
+      const row = sessionToolOverride(sessionKey);
+      if (row && typeof row[flag] === 'boolean') return row[flag];
+    }
     return cfg.socialV2?.tools?.[flag] !== false;
   }
 
@@ -5215,6 +5399,8 @@ async function main() {
         // （见上面的 agentAllowed 白名单）。
         if (req.method === 'GET' && url.pathname === '/api/permission-tiers') {
           const entries = [];
+          const overrides = readSessionPresets();
+          const toolOverrides = readSessionTools();
           const push = (kind, id) => {
             // 用 canonical key：白名单里可能带前导零（'0123'），与 '123' 是同一个会话。
             const key = canonicalV2Key(`${kind}:${id}`) ?? `${kind}:${id}`;
@@ -5224,6 +5410,11 @@ async function main() {
               key,
               tier: tier || 'chat',
               preset,
+              // 会话级覆盖：非 null 表示这个 preset 是操作者单独指定的，不是档位算出来的。
+              // 界面要能分开显示「档位默认」和「你改过」，否则改完之后忘了就再也想不起来。
+              override: sessionPresetOverride(key, overrides) ?? null,
+              // 会话级工具开关覆盖（稀疏：只记被改过的那几个）。界面用它显示「已覆盖」。
+              toolOverrides: sessionToolOverride(key, toolOverrides) ?? null,
               // null = DSH preset 清单还没拿到（启动瞬间）；false = 该档 preset 没装 ⇒ fail-closed
               available: dshPresetIds.length === 0 ? null : dshPresetIds.includes(preset),
               sessionId: state.sessions[key] ?? null,
@@ -5234,6 +5425,19 @@ async function main() {
           for (const id of cfg.allow?.groups ?? []) push('group', id);
           const seen = new Set();
           const sessions = entries.filter((e) => (seen.has(e.key) ? false : (seen.add(e.key), true)));
+          // 只在本会话列表里出现的覆盖（会话被移出白名单、或从没在名单里）也要露面，
+          // 否则界面上「移除覆盖」按钮永远够不到那条记录。
+          for (const [key, preset] of Object.entries(overrides)) {
+            if (seen.has(key)) continue;
+            seen.add(key);
+            sessions.push({
+              key, tier: sessionTier(key, currentMode, cfg) || 'chat', preset,
+              override: preset,
+              toolOverrides: sessionToolOverride(key, toolOverrides) ?? null,
+              available: dshPresetIds.length === 0 ? null : dshPresetIds.includes(preset),
+              sessionId: state.sessions[key] ?? null,
+            });
+          }
           sendJson({
             mode: currentMode,
             ownerQQ: cfg.ownerQQ ?? null,
@@ -5242,10 +5446,92 @@ async function main() {
               readonly: TIER_PRESETS.READONLY,
               chat: currentMode === 'reserved2' ? (cfg.socialV2?.agentPreset || cfg.agentPreset) : cfg.agentPreset,
             },
+            // 可选的档位清单：界面下拉直接用它，别在 HTML 里再抄一份（改清单时漏抄一处就是两个真相）。
+            choices: [...SESSION_PRESET_CHOICES],
             dshPresets: dshPresetIds,
+            // 可覆盖的开关清单与全局当前值：界面一个都不许自己抄（同 choices 的理由）。
+            toolFlags: Object.entries(cfg.socialV2?.tools ?? {}).map(([flag, on]) => ({ flag, global: on !== false })),
+            sessionTools: Object.fromEntries(Object.entries(toolOverrides).map(([k, v]) => [k, { ...v }])),
             deny: cfg.deny ?? { private: [], groups: [] },
             sessions,
           });
+          return;
+        }
+        // 设置/清除某个会话的 preset 覆盖（只认四个 qq-chat*，见 SESSION_PRESET_CHOICES）。
+        // 与 /api/role 的会话级覆盖同形：preset=null 或 fallback=true 表示删除该条。
+        if (req.method === 'POST' && url.pathname === '/api/session-preset') {
+          const body = await readBody();
+          const key = canonicalV2Key(String(body.key ?? '').trim());
+          if (!key) {
+            sendJson({ ok: false, error: 'key 必须是 group:群号 或 private:QQ号' }, 400);
+            return;
+          }
+          const hasField = Object.prototype.hasOwnProperty.call(body, 'preset');
+          if (!hasField && body.fallback !== true) {
+            sendJson({ ok: false, error: '缺少参数：preset 传档位名，传 null 或 fallback=true 表示移除覆盖' }, 400);
+            return;
+          }
+          try {
+            const clear = body.fallback === true || body.preset === null || body.preset === '';
+            if (clear) {
+              writeSessionPreset(key, CLEAR_SESSION_PRESET);
+              log(`控制台：已移除 ${key} 的 preset 覆盖（回落到档位默认）`);
+              // 覆盖变了策略就变：立刻判定一次，让旧映射退役、下次消息按新 preset 建会话。
+              reconcileSessionPolicies();
+              sendJson({ ok: true, key, preset: null, sessions: readSessionPresets() });
+              return;
+            }
+            const preset = String(body.preset).trim();
+            if (!dshPresetIds.includes(preset)) {
+              // 清单还没拿到（启动瞬间）时只做名字校验，别拿"还没拉清单"当"不存在"拒掉。
+              if (dshPresetIds.length > 0) {
+                sendJson({ ok: false, error: `preset「${preset}」不在 DSH 可用清单中（${dshPresetIds.join(', ')}）` }, 400);
+                return;
+              }
+            }
+            writeSessionPreset(key, preset);
+            log(`控制台：会话 ${key} 的 preset 覆盖已设置为 ${preset}`);
+            reconcileSessionPolicies();
+            sendJson({ ok: true, key, preset, sessions: readSessionPresets() });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 400);
+          }
+          return;
+        }
+        // 设置/清除某个会话的**单个** MCP 工具开关（会话级覆盖 socialV2.tools）。
+        // enabled=null（或 fallback=true）表示删掉这一条覆盖，回落到全局开关。
+        //
+        // 为什么一次只改一个 flag：覆盖表是稀疏的（只记"被改过的那几个"），
+        // 整表覆盖会把"以后新增的工具"永久钉死在旧状态上。逐个改就不会。
+        if (req.method === 'POST' && url.pathname === '/api/session-tool') {
+          const body = await readBody();
+          const key = canonicalV2Key(String(body.key ?? '').trim());
+          if (!key) {
+            sendJson({ ok: false, error: 'key 必须是 group:群号 或 private:QQ号' }, 400);
+            return;
+          }
+          const flag = String(body.flag ?? '').trim();
+          if (!flag) {
+            sendJson({ ok: false, error: '缺少参数：flag 是 socialV2.tools 里的开关名' }, 400);
+            return;
+          }
+          if (!isV2ToolFlag(flag, cfg.socialV2?.tools)) {
+            sendJson({ ok: false, error: `未知的工具开关：${flag}` }, 400);
+            return;
+          }
+          const enabled = body.enabled;
+          const clear = body.fallback === true || enabled === null || enabled === undefined;
+          if (!clear && typeof enabled !== 'boolean') {
+            sendJson({ ok: false, error: 'enabled 只能是 true / false，传 null 表示清除覆盖' }, 400);
+            return;
+          }
+          try {
+            const bag = writeSessionTool(key, flag, clear ? CLEAR_SESSION_TOOL : enabled, cfg.socialV2?.tools);
+            log(`控制台：会话 ${key} 的 ${flag} 覆盖已${clear ? '移除（回落到全局开关）' : `设为 ${enabled}`}`);
+            sendJson({ ok: true, key, flag, enabled: clear ? null : enabled, sessionTools: bag });
+          } catch (error) {
+            sendJson({ ok: false, error: String(error?.message ?? error) }, 400);
+          }
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/whitelist') {
@@ -6007,7 +6293,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('socialState')) { sendJson({ ok: false, error: '工具未启用：qq_social_state' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('socialState', key)) { sendJson({ ok: false, error: '工具未启用：qq_social_state' }, 403); return; }
           const st = getSocialV2State(key);
           sendJson({
             ok: true,
@@ -6026,7 +6312,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getPrompt')) { sendJson({ ok: false, error: '工具未启用：qq_get_prompt' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getPrompt', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_prompt' }, 403); return; }
           const st = getSocialV2State(key);
           // 让 prompt 里的表情摘要尽量新鲜：按 TTL 同步一次 QQ 收藏表情（失败不阻塞）。
           if (cfg.socialV2?.sticker?.enabled !== false) {
@@ -6383,7 +6669,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getUnread')) { sendJson({ ok: false, error: '工具未启用：qq_get_unread_messages' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getUnread', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_unread_messages' }, 403); return; }
           const afterRaw = url.searchParams.get('afterSeq');
           const afterSeq = afterRaw === null ? null : Number(afterRaw);
           if (afterRaw !== null && (!/^\d+$/.test(afterRaw) || !Number.isSafeInteger(afterSeq) || afterSeq < 0)) {
@@ -6408,7 +6694,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_recent_messages' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getRecent', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_recent_messages' }, 403); return; }
           const st = getSocialV2State(key);
           const start = Math.max(0, st.recentMessages.length - offset - limit);
           const end = Math.max(0, st.recentMessages.length - offset);
@@ -6425,7 +6711,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('markRead')) { sendJson({ ok: false, error: '工具未启用：qq_mark_read' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('markRead', key)) { sendJson({ ok: false, error: '工具未启用：qq_mark_read' }, 403); return; }
           const st = getSocialV2State(key);
           // 注意：不带 throughSeq 的调用会清空全部未读，这是**有意保留的兼容语义**
           // （旧 preset 与「没有水位」的收尾调用；见 acknowledgeMessagesV2 的注释与
@@ -6480,11 +6766,11 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('setWakeConfig')) { sendJson({ ok: false, error: '工具未启用：qq_set_wake_config' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('setWakeConfig', key)) { sendJson({ ok: false, error: '工具未启用：qq_set_wake_config' }, 403); return; }
           const st = getSocialV2State(key);
           const throughSeq = requestedReadThroughSeqV2(st, body, !!req.headers['x-agent-token']);
           // Preserve the deployed behavior: with markRead disabled, update wake configuration only.
-          const acknowledgeOnClose = throughSeq !== null && v2ToolEnabled('markRead');
+          const acknowledgeOnClose = throughSeq !== null && v2ToolEnabled('markRead', key);
           const input = body.config && typeof body.config === 'object' && !Array.isArray(body.config) ? body.config : {};
           const current = st.wakeConfig;
           const inputTriggers = input.triggers && typeof input.triggers === 'object' && !Array.isArray(input.triggers) ? input.triggers : {};
@@ -6864,7 +7150,7 @@ async function main() {
           }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendBurst')) { sendJson({ ok: false, error: '工具未启用：qq_send_burst' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendBurst', key)) { sendJson({ ok: false, error: '工具未启用：qq_send_burst' }, 403); return; }
           if (currentMode !== 'reserved2') {
             sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403);
             return;
@@ -7011,7 +7297,7 @@ async function main() {
           }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：qq_send_message' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendMessage', key)) { sendJson({ ok: false, error: '工具未启用：qq_send_message' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
@@ -7149,7 +7435,7 @@ async function main() {
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送拍一拍必须携带 agent token' }, 403); return; }
           if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (!v2ToolEnabled('sendPoke')) { sendJson({ ok: false, error: '工具未启用：qq_send_poke' }, 403); return; }
+          if (!v2ToolEnabled('sendPoke', key)) { sendJson({ ok: false, error: '工具未启用：qq_send_poke' }, 403); return; }
           if (socialV2.paused) { sendJson({ ok: false, error: '二代 AI 已暂停，不能发送拍一拍' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -7249,7 +7535,7 @@ async function main() {
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
           try {
             const entry = await getStickerImageData(stickerId);
             const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
@@ -7288,7 +7574,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getSelfImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_self_image' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getSelfImage', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_self_image' }, 403); return; }
           const selfPath = path.join(ROOT, 'assets', 'deepseek娘.png');
           try {
             if (!fs.existsSync(selfPath)) { sendJson({ ok: false, error: '未找到 AI 形象图片 assets/deepseek娘.png' }, 404); return; }
@@ -7308,7 +7594,7 @@ async function main() {
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('stickerNote')) { sendJson({ ok: false, error: '工具未启用：qq_sticker_note' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('stickerNote', key)) { sendJson({ ok: false, error: '工具未启用：qq_sticker_note' }, 403); return; }
           const note = body.note !== undefined && body.note !== null ? String(body.note).trim().slice(0, 200) : undefined;
           const tags = body.tags !== undefined && body.tags !== null ? (Array.isArray(body.tags) ? body.tags.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20) : []) : undefined;
           const usage = body.usage !== undefined && body.usage !== null ? String(body.usage).trim().slice(0, 200) : undefined;
@@ -7326,7 +7612,7 @@ async function main() {
           if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('setStickerRemark')) { sendJson({ ok: false, error: '工具未启用：qq_set_sticker_remark' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('setStickerRemark', key)) { sendJson({ ok: false, error: '工具未启用：qq_set_sticker_remark' }, 403); return; }
           try {
             const entry = await setStickerRemarkV2(stickerId, String(body.remark ?? ''));
             log(`[sticker] 修改 QQ 收藏表情备注 ${key}: ${entry.id} -> ${entry.desc}`);
@@ -7463,7 +7749,7 @@ async function main() {
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
           if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (!v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
+          if (!v2ToolEnabled('sendVoice', key)) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
           if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
@@ -7551,7 +7837,7 @@ async function main() {
             sendJson({ ok: false, error: '发文件仅限管理员本人私聊（Owner 档）：群聊与白名单会话不能外发本机文件' }, 403);
             return;
           }
-          if (!v2ToolEnabled('sendFile')) { sendJson({ ok: false, error: '工具未启用：qq_send_file' }, 403); return; }
+          if (!v2ToolEnabled('sendFile', key)) { sendJson({ ok: false, error: '工具未启用：qq_send_file' }, 403); return; }
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
           try {
             fileBudgetCheck(key, fc);
@@ -7586,7 +7872,7 @@ async function main() {
           }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendSticker')) { sendJson({ ok: false, error: '工具未启用：qq_send_sticker' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendSticker', key)) { sendJson({ ok: false, error: '工具未启用：qq_send_sticker' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
@@ -7675,7 +7961,7 @@ async function main() {
           if (!key || !messageRef) { sendJson({ ok: false, error: 'key 和 messageId/seq 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('collectSticker')) { sendJson({ ok: false, error: '工具未启用：qq_collect_sticker' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('collectSticker', key)) { sendJson({ ok: false, error: '工具未启用：qq_collect_sticker' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
           const st = getSocialV2State(key);
@@ -7723,7 +8009,7 @@ async function main() {
           if (agentCall && !key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (agentCall && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (agentCall && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (agentCall && !v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
+          if (agentCall && !v2ToolEnabled('sendVoice', key)) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
           const wantProbe = url.searchParams.get('probe') !== '0';
           try {
             const files = listAudioFiles(voice.dir);
@@ -7772,7 +8058,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('listStickers')) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('listStickers', key)) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
           try {
             const synced = await syncStickerLibrary(force);
             const list = formatStickerList(synced?.entries ?? stickerEntries, query, count);
@@ -7793,7 +8079,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('listStickers')) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('listStickers', key)) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
           // AI 强制刷新加最小间隔，避免反复调用 OneBot 表情接口造成限频/负载。
           if (req.headers['x-agent-token'] && force) {
             const now = Date.now();
@@ -7945,7 +8231,7 @@ async function main() {
           const replyWait = body.purpose === 'reply';
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('waitMessages')) { sendJson({ ok: false, error: '工具未启用：qq_wait_for_messages' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('waitMessages', key)) { sendJson({ ok: false, error: '工具未启用：qq_wait_for_messages' }, 403); return; }
           if (socialV2.paused) {
             const st = getSocialV2State(key);
             sendJson({ ok: true, key, paused: true, arrived: false, timeout: false, waitedMs: 0, newMessages: [], readThroughSeq: readThroughSeqV2(st), unreadCount: st.unread.length });
@@ -8005,7 +8291,7 @@ async function main() {
           // A reply wait must also include messages received while the model
           // was reading/thinking after its snapshot, before this HTTP request.
           const requestSeq = st.lastUnreadSeq || 0;
-          const baseline = replyWait && (v2ToolEnabled('getUnread') || v2ToolEnabled('getRecent')) ? readThroughSeqV2(st) : requestSeq;
+          const baseline = replyWait && (v2ToolEnabled('getUnread', key) || v2ToolEnabled('getRecent', key)) ? readThroughSeqV2(st) : requestSeq;
           const start = Date.now();
           let arrived = false;
           let lastNewAt = 0;
@@ -8065,7 +8351,7 @@ async function main() {
           }
           if (socialV2.conversations.get(canonicalV2Key(key)) !== st ||
               (req.headers['x-agent-token'] && (currentMode !== 'reserved2' || socialV2.paused || cfg.socialV2?.enabled === false
-                || !agentTokenOk(key, req.headers['x-agent-token']) || !v2SessionAllowed(key) || !v2ToolEnabled('waitMessages')))) {
+                || !agentTokenOk(key, req.headers['x-agent-token']) || !v2SessionAllowed(key) || !v2ToolEnabled('waitMessages', key)))) {
             finishWait();
             sendJson({ ok: false, error: '等待期间会话已重置或权限已变化，请重新读取会话' }, 403);
             return;
@@ -8085,8 +8371,8 @@ async function main() {
           // through either newMessages or the watermark, so the buffer is dropped
           // before arrival is judged -- not filtered afterwards.
           const history = replyWait
-            ? [...(v2ToolEnabled('getUnread') ? st.unread : []),
-              ...(v2ToolEnabled('getRecent') ? st.recentMessages : [])]
+            ? [...(v2ToolEnabled('getUnread', key) ? st.unread : []),
+              ...(v2ToolEnabled('getRecent', key) ? st.recentMessages : [])]
             : (Array.isArray(st.recentMessages) ? st.recentMessages : []);
           // ── 漏消息窗口（2026-10-18 修）──────────────────────────────────
           //
@@ -8178,7 +8464,7 @@ async function main() {
             sendJson({ ok: false, error: 'tool 必须是 sendGroup/sendPrivate/reply' }, 400);
             return;
           }
-          if (!v2ToolEnabled(flag)) {
+          if (!v2ToolEnabled(flag, key)) {
             sendJson({ ok: false, error: `工具未启用：qq_${tool === 'sendGroup' ? 'send_group_message' : tool === 'sendPrivate' ? 'send_private_message' : 'reply'}` }, 403);
             return;
           }
@@ -8257,7 +8543,7 @@ async function main() {
           if (!key || !rawMessage) { sendJson({ ok: false, error: 'key 和 message 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('feedback')) { sendJson({ ok: false, error: '工具未启用：qq_report_feedback' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('feedback', key)) { sendJson({ ok: false, error: '工具未启用：qq_report_feedback' }, 403); return; }
           // 反馈限频：防止持有会话 token 的调用方刷磁盘/日志。
           const fNow = Date.now();
           const fTimes = feedbackTimes.get(key) || [];
@@ -8286,7 +8572,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getMyRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_my_recent_messages' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getMyRecent', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_my_recent_messages' }, 403); return; }
           const st = getSocialV2State(key);
           const mine = st.recentMessages.filter((m) => m.isSelf).slice(-limit);
           sendJson({ ok: true, key, messages: mine, readThroughSeq: readThroughSeqV2(st) });
@@ -8303,7 +8589,7 @@ async function main() {
           if (!key || !messageId) { sendJson({ ok: false, error: 'key 和 messageId 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getMessageDetail')) { sendJson({ ok: false, error: '工具未启用：qq_get_message_detail' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getMessageDetail', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_message_detail' }, 403); return; }
           const keyMatch = /^(group|private):(\d+)$/.exec(key);
           if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
           const kind = keyMatch[1];
@@ -8373,7 +8659,7 @@ async function main() {
             sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
             return;
           }
-          if (!v2ToolEnabled('getForwardMsg')) {
+          if (!v2ToolEnabled('getForwardMsg', key)) {
             sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403);
             return;
           }
@@ -8447,7 +8733,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getForwardMsg')) { sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getForwardMsg', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '转发媒体读取仅 reserved2 模式可用' }, 403); return; }
           if (!media.length) { sendJson({ ok: true, key, media: [], images: [] }); return; }
           try {
@@ -8465,7 +8751,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getActiveMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_active_members' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getActiveMembers', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_active_members' }, 403); return; }
           const st = getSocialV2State(key);
           const map = new Map();
           for (const m of st.recentMessages) {
@@ -8506,7 +8792,7 @@ async function main() {
             ? allowed('group', Number(groupMatch[1]), cfg)
             : v2SessionAllowed(key);
           if (!groupMembersAllowed) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('getGroupMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_group_members' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('getGroupMembers', key)) { sendJson({ ok: false, error: '工具未启用：qq_get_group_members' }, 403); return; }
           const groupId = Number(groupMatch[1]);
           try {
             let response;
@@ -8543,7 +8829,7 @@ async function main() {
           if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要 extra.target 指定群友名字' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_append' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory', key)) { sendJson({ ok: false, error: '工具未启用：qq_memory_append' }, 403); return; }
           const st = getSocialV2State(key);
           appendMemoryV2(st, category, content, extra, key);
           sendJson({ ok: true, key, category, content, memory: formatMemoryV2(st) + formatSharedNotesV2(key) });
@@ -8571,7 +8857,7 @@ async function main() {
           if (category !== 'memberImpression' && !oldContent) { sendJson({ ok: false, error: '该类别需要 oldContent 指定要编辑的记忆内容' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_*' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory', key)) { sendJson({ ok: false, error: '工具未启用：qq_memory_*' }, 403); return; }
           const st = getSocialV2State(key);
           if (category === 'activeTopic' && Array.isArray(st.activeTopics)) {
             const idx = st.activeTopics.findIndex((t) => String(t?.text ?? '') === oldContent);
@@ -8638,7 +8924,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_query' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory', key)) { sendJson({ ok: false, error: '工具未启用：qq_memory_query' }, 403); return; }
           const st = getSocialV2State(key);
           const raw = {
             activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-20) : [],
@@ -8676,7 +8962,7 @@ async function main() {
           if (category !== 'memberImpression' && !content) { sendJson({ ok: false, error: '该类别需要 content 指定要删除的记忆内容' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_remove' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory', key)) { sendJson({ ok: false, error: '工具未启用：qq_memory_remove' }, 403); return; }
           const st = getSocialV2State(key);
           if (category === 'shared') {
             // 全局记忆任何会话都能删 —— 它本来就是共享的。
@@ -8707,7 +8993,7 @@ async function main() {
           if (category && !['activeTopic', 'pendingThought', 'memberImpression', 'selfNote', 'shared'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression / selfNote / shared' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_clear' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('memory', key)) { sendJson({ ok: false, error: '工具未启用：qq_memory_clear' }, 403); return; }
           const st = getSocialV2State(key);
           if (!category || category === 'activeTopic') st.activeTopics = [];
           if (!category || category === 'pendingThought') st.pendingThoughts = [];
@@ -8728,7 +9014,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangQuery')) { sendJson({ ok: false, error: '工具未启用：qq_slang_query' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangQuery', key)) { sendJson({ ok: false, error: '工具未启用：qq_slang_query' }, 403); return; }
           const list = confirmedSlangListV2().filter((e) => {
             if (!q) return true;
             return e.content.toLowerCase().includes(q)
@@ -8754,7 +9040,7 @@ async function main() {
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangSubmit')) { sendJson({ ok: false, error: '工具未启用：qq_slang_submit' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangSubmit', key)) { sendJson({ ok: false, error: '工具未启用：qq_slang_submit' }, 403); return; }
           if (cfg.slang?.enabled === false) { sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 403); return; }
           if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
           if (content.length > 50) { sendJson({ ok: false, error: '黑话词条过长（最多 50 字）' }, 400); return; }
@@ -8850,11 +9136,11 @@ async function main() {
             sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
             return;
           }
-          if (agentToken && !v2ToolEnabled('getImages')) {
+          if (agentToken && !v2ToolEnabled('getImages', key)) {
             sendJson({ ok: false, error: '工具未启用：qq_get_message_images' }, 403);
             return;
           }
-          if (!agentToken && currentMode === 'closed-agent' && !v2ToolEnabled('getImages')) {
+          if (!agentToken && currentMode === 'closed-agent' && !v2ToolEnabled('getImages', key)) {
             sendJson({ ok: false, error: '工具未启用：qq_get_message_images' }, 403);
             return;
           }
@@ -8907,7 +9193,7 @@ async function main() {
           if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
           if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
           const flag = isPrivate ? 'sendPrivate' : (isReply ? 'reply' : 'sendGroup');
-          if (token && !v2ToolEnabled(flag)) { sendJson({ ok: false, error: `工具未启用：${flag}` }, 403); return; }
+          if (token && !v2ToolEnabled(flag, key)) { sendJson({ ok: false, error: `工具未启用：${flag}` }, 403); return; }
           if (shouldBlockSilentReply(key)) {
             sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403);
             return;
@@ -12894,7 +13180,7 @@ async function main() {
 
   function buildWakeSnapshotV2(key) {
     const context = cfg.socialV2?.context ?? {};
-    if (context.inlineWakeMessages === false || (!v2ToolEnabled('getUnread') && !v2ToolEnabled('getRecent'))) return null;
+    if (context.inlineWakeMessages === false || (!v2ToolEnabled('getUnread', key) && !v2ToolEnabled('getRecent', key))) return null;
     const st = getSocialV2State(key);
     const bounded = (name, fallback, min, max) => {
       const value = Number(context[name] ?? fallback);
@@ -12936,11 +13222,11 @@ async function main() {
       packet.partial = packet.messages.length < st.unread.length;
       return false;
     };
-    if (v2ToolEnabled('getUnread')) {
+    if (v2ToolEnabled('getUnread', key)) {
       // Oldest unread first: a budget cutoff must not silently acknowledge unseen messages.
       for (const msg of st.unread.slice(0, maxUnread)) if (!tryAdd('messages', msg)) break;
     }
-    if (v2ToolEnabled('getRecent') && maxRecent > 0) {
+    if (v2ToolEnabled('getRecent', key) && maxRecent > 0) {
       const unread = new Set(st.unread.map((m) => m.seq));
       let recent = st.recentMessages.filter((m) => !Number.isSafeInteger(m.seq) || !unread.has(m.seq)).slice(-maxRecent);
       // 按时间再筛一道：热聊时这批跨度只有几分钟，这条线切不到东西；冷场几小时后被叫醒时

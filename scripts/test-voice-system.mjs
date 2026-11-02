@@ -121,7 +121,7 @@ console.log('## qq-bridge 语音系统：路由与开关');
   for (const route of ["'/api/voice/send'", "'/api/send/voice'", "'/api/socialV2/send-voice'", "'/api/voice/list'", "'/api/socialV2/voices'"]) {
     ok(bridge.includes(route), `路由 ${route}`);
   }
-  ok(/v2ToolEnabled\('sendVoice'\)/.test(bridge), 'AI 路由受 tools.sendVoice 开关控制');
+  ok(/v2ToolEnabled\('sendVoice',\s*key\)/.test(bridge), 'AI 路由受 tools.sendVoice 开关控制（带 key：会话级覆盖要能压过全局）');
   ok(/voiceBudgetCheck/.test(bridge) && /voiceBudgetCommit/.test(bridge), '语音额度：检查与记账分离');
   ok(/assertOutboundAuditOk/.test(bridge), '语音文件名审计存在');
   ok(/verifyVoiceMessageSent/.test(bridge), '发送后回读校验存在');

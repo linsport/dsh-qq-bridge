@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { dshModulesDir } from './dsh-modules.mjs';
+import { readAsarIndex, readAsarFile, closeAsar, findDshAsar } from './asar-read.mjs';
 
 /** 名字形态：小写字母开头，允许下划线与连字符，长度合理。 */
 export const TOOL_NAME_RE = /^[a-z][a-z0-9_-]{1,40}$/;
@@ -26,6 +27,25 @@ export const TOOL_NAME_RE = /^[a-z][a-z0-9_-]{1,40}$/;
 /** DSH 自带包所在目录（`<node_modules>/@deepseek-ai`）。 */
 export function dshPackagesDir() {
   return process.env.DSH_TOOL_PACKAGES || path.join(dshModulesDir(), '@deepseek-ai');
+}
+
+/**
+ * 目录里到底有几个 DSH 包。
+ *
+ * 为什么需要它：`dshModulesDir()` 走的是 Node 模块解析，解析得到的是
+ * **profile 自己的 node_modules** —— 桌面版把整套 `@deepseek-ai/*` 打在
+ * `resources/app.asar` 里，profile 目录下只剩 cosmokit / schemastery 这类间接
+ * 依赖。于是 `dshPackagesDir()` 会成功返回一个**存在的空目录**，扫描器输出
+ * 「扫描包数：0」而不报错，对账就此静默失效（2026-11-01 实测）。
+ */
+function countDshPackages(dir) {
+  let n = 0;
+  try {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory() && e.name.startsWith('dsh-')) n++;
+    }
+  } catch { return 0; }
+  return n;
 }
 
 /** 用户安装的第三方插件目录（也会注册工具：plugin-guard / 超级注入器等）。 */
@@ -68,14 +88,64 @@ function extractFromPatch(text, source, add) {
 }
 
 /**
+ * 从 app.asar 里抽工具名（桌面版 DSH 的唯一真实来源）。
+ *
+ * 只扫 `@deepseek-ai/*` 下的 `.js/.mjs/.cjs/.ts/.d.ts` 与 `*.patch.ya?ml`，
+ * 包名取 `dsh/node_modules/@deepseek-ai/<包名>/` 那一段，其余（`renderer/`、
+ * `lib/` 等应用自身代码）不扫 —— 那些不是工具包，扫进来只会制造噪声。
+ *
+ * @returns `{ names: Map<name, Set<source>>, packages: string[] }`；
+ *          asar 读不了时返回 `null`（调用方据此决定是否降级/报错）。
+ */
+function collectFromAsar(asarPath) {
+  let archive;
+  try { archive = readAsarIndex(asarPath); } catch { return null; }
+  const names = new Map();
+  const packages = new Set();
+  const add = (name, source) => {
+    if (!TOOL_NAME_RE.test(name)) return;
+    if (!names.has(name)) names.set(name, new Set());
+    names.get(name).add(source);
+  };
+  try {
+    for (const [rel, entry] of archive.files) {
+      const m = /^\/dsh\/node_modules\/@deepseek-ai\/([^/]+)\//.exec(rel);
+      if (!m) continue;
+      const pkg = m[1];
+      const isSource = /\.(js|mjs|cjs|ts)$/.test(rel) || rel.endsWith('.d.ts');
+      const isPatch = /\.patch\.ya?ml$/.test(rel);
+      if (!isSource && !isPatch) continue;
+      packages.add(pkg);
+      const text = readAsarFile(asarPath, archive, entry, rel);
+      if (!text) continue;
+      if (isPatch) extractFromPatch(text, pkg, add);
+      else extractFromSource(text, pkg, add);
+    }
+  } finally {
+    closeAsar(archive);
+  }
+  return { names, packages: [...packages].sort() };
+}
+
+/**
  * 抽取已安装 DSH（及其插件）里出现的全部工具名。
+ *
+ * DSH 包来源按「先真后兜底」：
+ *   ① `options.packagesDir` / `DSH_TOOL_PACKAGES`（显式指定，最高优先级）
+ *   ② `dshModulesDir()/@deepseek-ai` 里**确实有 dsh-* 包**时用目录
+ *   ③ 否则读 `app.asar`（桌面版；路径由 `findDshAsar()` 找）
+ *   ④ 都没有 ⇒ 抛错并给出可操作指引
+ * 之所以不再默默返回空集：空集会被上层当成「所有名字都是假名」，方向性的错。
  *
  * @param options.packagesDir - `@deepseek-ai` 目录；缺省按 {@link dshPackagesDir} 解析。
  * @param options.pluginDirs - 第三方插件目录列表；缺省按 {@link dshPluginDirs} 解析。
- * @returns `{ names: Map<name, Set<source>>, packages: string[] }`。
+ * @param options.asarPath - 显式指定 app.asar；缺省由 `findDshAsar()` 探测。
+ * @param options.allowEmpty - 允许在「一个 DSH 包都没扫到」时返回空集而不抛错
+ *        （给只能离线跑的场景留口子；默认 false）。
+ * @returns `{ names: Map<name, Set<source>>, packages: string[], source: 'dir'|'asar'|'empty' }`。
  *          `packages` 是实际扫过的包/插件名，便于诊断「一个都没扫到」。
  */
-export function collectDshToolNames({ packagesDir, pluginDirs } = {}) {
+export function collectDshToolNames({ packagesDir, pluginDirs, asarPath, allowEmpty = false } = {}) {
   const names = new Map();
   const packages = [];
   const add = (name, source) => {
@@ -84,21 +154,66 @@ export function collectDshToolNames({ packagesDir, pluginDirs } = {}) {
     names.get(name).add(source);
   };
 
-  const roots = [];
-  const pkgRoot = packagesDir ?? dshPackagesDir();
-  if (fs.existsSync(pkgRoot)) roots.push({ dir: pkgRoot, filter: /^dsh-/ });
+  let source = 'empty';
+  const explicitDir = packagesDir ?? process.env.DSH_TOOL_PACKAGES ?? null;
+  if (explicitDir) {
+    // 显式指定的目录：存在就扫，不存在就说清楚，不偷偷换来源。
+    if (!fs.existsSync(explicitDir)) {
+      throw new Error(
+        `指定的 DSH 工具包目录不存在：${explicitDir}\n`
+        + '  检查 DSH_TOOL_PACKAGES / DSH_INSTALL_MODULES 是否指错。'
+      );
+    }
+    source = 'dir';
+  } else {
+    let dir = null;
+    try { dir = dshPackagesDir(); } catch { dir = null; }
+    if (dir && countDshPackages(dir) > 0) {
+      packagesDir = dir;
+      source = 'dir';
+    } else {
+      // 桌面版：走 asar。
+      const found = asarPath ?? findDshAsar();
+      if (found) {
+        const fromAsar = collectFromAsar(found);
+        if (fromAsar && fromAsar.names.size > 0) {
+          source = 'asar';
+          packages.push(...fromAsar.packages);
+          for (const [name, srcs] of fromAsar.names) {
+            for (const s of srcs) add(name, s);
+          }
+        }
+      }
+    }
+  }
+
+  if (source === 'dir') {
+    const pkgRoot = packagesDir;
+    if (fs.existsSync(pkgRoot)) {
+      let entries = [];
+      try { entries = fs.readdirSync(pkgRoot, { withFileTypes: true }); } catch { entries = []; }
+      for (const e of entries) {
+        if (!e.isDirectory()) continue;
+        if (!/^dsh-/.test(e.name)) continue;
+        const pkgDir = path.join(pkgRoot, e.name);
+        packages.push(e.name);
+        for (const f of walkFiles(pkgDir)) {
+          let text = '';
+          try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+          if (/\.(js|mjs|cjs)$/.test(f) || f.endsWith('.d.ts')) extractFromSource(text, e.name, add);
+          else if (/\.patch\.ya?ml$/.test(f)) extractFromPatch(text, e.name, add);
+        }
+      }
+    }
+  }
+
   for (const dir of pluginDirs ?? dshPluginDirs()) {
     // 用户的插件目录里全是插件包（含 .bak-* 备份，也一起扫：备份里的旧名字
     // 仍然说明这个名字曾经真实存在）。
-    roots.push({ dir, filter: null });
-  }
-
-  for (const { dir, filter } of roots) {
     let entries = [];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
       if (!e.isDirectory()) continue;
-      if (filter && !filter.test(e.name)) continue;
       const pkgDir = path.join(dir, e.name);
       packages.push(e.name);
       for (const f of walkFiles(pkgDir)) {
@@ -109,7 +224,19 @@ export function collectDshToolNames({ packagesDir, pluginDirs } = {}) {
       }
     }
   }
-  return { names, packages };
+
+  if (names.size === 0) {
+    if (!allowEmpty) {
+      throw new Error(
+        '一个 DSH 工具名都没抽到 —— 对账无法进行。\n'
+        + '  桌面版请设 DSH_ASAR=<安装目录>/resources/app.asar（本机装在非默认盘时必须显式给）；\n'
+        + '  命令行版请设 DSH_INSTALL_MODULES=<DSH 安装目录>/node_modules，\n'
+        + '  或 DSH_TOOL_PACKAGES=<...>/node_modules/@deepseek-ai。'
+      );
+    }
+    source = 'empty';
+  }
+  return { names, packages, source };
 }
 
 /** 便利包装：只要名字集合。 */

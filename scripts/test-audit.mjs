@@ -84,6 +84,15 @@ const tests = [
   // （allowAllWhenEmpty 不得提权）、deny 前置、新 preset 缺失时 fail-closed、
   // 以及档位变化触发会话重建。纯离线，跑的是真实 bridge.js（VM harness）。
   'test-permission-tiers.mjs',
+  // 会话级 preset 档位覆盖（2026-11-02）：给单个会话单独指定用哪个 preset。
+  // 钉住的是「可选值只有四个 qq-chat*」—— 一旦允许写 standard（DSH 默认 preset，
+  // 带 bash/文件读写），三档分级的 fail-closed 就白做了；另外验覆盖压过档位默认、
+  // 只对自己那个 key 生效、删除后回落、变更触发会话重建。
+  'test-session-preset.mjs',
+  // 会话级 MCP 工具开关（2026-11-02）：socialV2.tools 原本是全局的，这里补调用期粒度。
+  // 钉住的是「关掉的工具仍在 schema 里、只是调用 403」这条硬限制不许被误解成可见性开关，
+  // 以及覆盖只对自己那个 key 生效、能升能降、未知 flag 写入即拒、AI 改不动它。
+  'test-session-tools.mjs',
   // 发文件（qq_send_file）：路径安全层（扩展名白名单 / 敏感路径黑名单 / 体积 / 普通文件）
   // + 真实路由闸门（只有 Owner 档能发出去；群聊 / 白名单 / 陌生会话一律 403 且不碰网关）。
   'test-send-file.mjs',

@@ -102,10 +102,15 @@ const OPTIONAL_BUNDLE_TOOLS = new Set(['subagent_codex', 'subagent_claude_code']
  * 它的包名白名单，`subagent_codex` 写在 `dsh-web-app/presets/*.patch.yml` 而非包根。
  * 误判方向很危险——它会逼人把真名字从守卫名单里删掉，等于自己拆掉安全边界。
  * 现在只保留一条实现，两边不可能再漂移。
+ *
+ * 第二个坑（2026-11-01）：抽取实现本身扫不到包时 `names.size === 0`，这里返回 null
+ * 后**静默跳过**整条断言 —— 桌面版把 `@deepseek-ai/*` 打进 app.asar，profile 的
+ * node_modules 里一个 DSH 包都没有，于是这条断言在本机长期空转、套件全绿。
+ * 现在抽取器自己会读 asar（自动定位 `resources/app.asar`），抽不到就**抛错**
+ * （除非显式 `allowEmpty`），所以这里不再需要 null 分支 —— 拿不到就让它红。
  */
 function collectDshToolNames() {
-  const { names } = collectDshToolNamesShared();
-  return names.size === 0 ? null : new Set(names.keys());
+  return new Set(collectDshToolNamesShared().names.keys());
 }
 /** 允许出现在名单里、但不属于"本地执行"语义的名字（开发/注入器）。 */
 const DEV_TOOL_PREFIX = /^dev_/;
@@ -212,11 +217,8 @@ test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错
   // 只打日志 ⇒ 拼错的名字 = **静默 no-op**。这正是本名单初版的真实缺陷：
   // pwsh_persistent / bash_persistent / cordis / goal_write / goal_read 五个假名
   // 让整批限制悄悄少生效，而套件当时全绿。
+  // 抽取器拿不到名字时会抛错（见 collectDshToolNames 上方注释），不会静默放过。
   const dshNames = collectDshToolNames();
-  if (dshNames === null) {
-    console.log('  ⏭  跳过：未找到 DSH 工具包（设 DSH_TOOL_PACKAGES 指向 @deepseek-ai 目录即可启用）');
-    return;
-  }
   for (const id of SIMULATION_PRESETS) {
     const { dir } = readPreset(id);
     const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);

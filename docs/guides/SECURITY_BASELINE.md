@@ -39,12 +39,24 @@
 
 | 机制 | 位置 | 行为 |
 | --- | --- | --- |
-| 预设工具守卫 | `plugins/qq-agent-presets/qq-tool-restrict.mjs`（唯一权威实现，`dsh/agent-presets/*/qq-tool-restrict.mjs` 只是 re-export 壳） | 两道闸门：① 注册期 `tools.restrict({deny})` 把本地执行/宿主运行期工具**从模型 schema 里隐藏**（82 个唯一名字，2026-10-26 对账；名单在导出/使用时去重 —— 重复项会让 diagnostics 的 skipped 计数虚高）；② 执行期 `tools.guard` 按 preset 行的 `config.mode` 分三档：`strict`（默认）仅 `mcp__snowluma__*` / `mcp__snowluma-host__*` / `mcp__web-search-safe__*` + `ask_user_question` / `todo_write`；`readonly` 额外放行 `read` / `read_image` / `glob` / `grep`；`open` 放行可授予的本地能力（read/write/edit/glob/grep/pwsh），但 `NEVER_GRANTED_TOOL_NAMES` 永不授予。空/未知名字一律拒绝，未知 mode 按 `strict` 处理（fail-closed）；内置 `tool-web` 的 search/fetch 关闭。对账工具：`npm run scan:tool-names`（**每次升级 DSH 后应跑一次**：`tools.restrict` 对不存在的名字会抛错并被逐个 try/catch 吞掉 ⇒ 假名 = 静默失效；新版本新增的能力若不补进名单 = 漏隐藏） |
+| 预设工具守卫 | `plugins/qq-agent-presets/qq-tool-restrict.mjs`（唯一权威实现，`dsh/agent-presets/*/qq-tool-restrict.mjs` 只是 re-export 壳） | 两道闸门：① 注册期先**探测全局层的真实工具清单**（`probeKnownGlobalTools()` 故意用一个不存在的名字触发 DSH 报错，从 `known global tools: …` 尾巴里把清单读出来），再按 allow 收敛 —— 只留下 `mcp__*` 与 `ask_user_question` / `todo_write`，其余一次性 `tools.restrict({deny:[…]})` 全部隐藏（2026-11-02 起；探测失败才退回旧的逐个 deny 路径，那条路径仍靠 82 个名字的名单兜底，名单在导出/使用时去重 —— 重复项会让 diagnostics 的 skipped 计数虚高）；② 执行期 `tools.guard` 按 preset 行的 `config.mode` 分三档：`strict`（默认）仅 `mcp__snowluma__*` / `mcp__snowluma-host__*` / `mcp__web-search-safe__*` + `ask_user_question` / `todo_write`；`readonly` 额外放行 `read` / `read_image` / `glob` / `grep`；`open` 放行可授予的本地能力（read/write/edit/glob/grep/pwsh），但 `NEVER_GRANTED_TOOL_NAMES` 永不授予。空/未知名字一律拒绝，未知 mode 按 `strict` 处理（fail-closed）；内置 `tool-web` 的 search/fetch 关闭。**对账工具**：`npm run scan:tool-names`（**每次升级 DSH 后应跑一次**：`tools.restrict` 对不存在的名字会抛错并被逐个 try/catch 吞掉 ⇒ 假名 = 静默失效；新版本新增的能力若不补进名单 = 漏隐藏） |
 | 预设 fail-closed | `resolvePresetName()` + `ensureSession()` | 会话拿不到**自己那一档**的受限预设时**拒绝建会话**，绝不回退到聊天 preset 或含本地工具的 DSH 默认预设；只有 `closed-agent`（管理员私聊）允许回退。三档分级的 preset（`qq-chat-owner` / `qq-chat-readonly`）同样走这条：没装进 DSH 就是"没有可安全使用的 preset" |
 | 发送强制白名单 | 所有 `/api/send/*`、`/api/socialV2/send-*` | 目标必须命中 `allow.groups` / `allow.private`（每次都重新校验，不做缓存） |
 | **发文件闸门**（2026-10-26） | `/api/socialV2/send-file` + `sessionTier()` + `src/send-file-lib.js` | `qq_send_file` 是唯一"主动把本机文件送出去"的工具，三道叠加：① **档位闸门** —— 只有 Owner 档（`private:<ownerQQ>`）能发，群聊/白名单/陌生会话一律 403 且**不产生任何出站调用**（MCP 工具是进程级注册的，无法按会话裁剪 schema，所以闸门必须在服务端）；② **路径与类型** —— 只发绝对路径的普通文件、扩展名白名单、敏感路径/密钥/桥接状态文件黑名单、体积上限，realpath 之后再判定（挡 symlink 逃逸）；③ **限流 + 文件名审计**（失败不吃额度） |
 | 动态 ACL | `resolveVoicePathForV2()` / `voicePathInsideLibrary()` | 语音只能取语音库目录内的文件；贴纸只能发收藏库内的表情；图片只能读 SnowLuma home 内的本地文件（realpath 复核防符号链接逃逸） |
 | **只探测、不部署**（L6 设计不变量） | `mcp-host-server.js` | 该 MCP server **只提供 `snowluma_status`（只读探活 `get_login_info`）**。⚠️ **v0.1.5 起删除了 `start_snowluma` / `stop_snowluma` 与 `snowluma.allowProcessControl`**：SnowLuma EULA §5.4 规定「将其并入第三方安装包或 Docker 镜像、**通过自动化脚本部署**」须事先书面授权，原生组件属**专有组件**。⇒ 本程序不安装、不复制、不打包、不程序化启停 SnowLuma；用户自行安装与启动。详见 `LICENSE` 与 `QSH-plan/QSH_PLAN.md` §6.0 |
+
+> **两道闸门各自的实际覆盖面（2026-11-01 对账后补记，别被"两道"这两个字误导）**
+>
+> - **注册期 `restrict` 只能挡「继承来的」工具，挡不住 preset 自己注册的 scoped 工具。** DSH 的实现里 `view(scope).restrictableNames` 只收全局层与祖先层的名字；preset 自己 `use()` 进来的工具只进 `knownNames` / `visible`，进不了 `restrictableNames`（源码注释写明这是刻意的，保护子 agent 自己的上报通道）。所以 `read` / `pwsh` / `glob` 这类名字在守卫眼里永远是「unknown global tool」，逐个 try/catch 吞掉 —— 82 个名字里只有 5 个在典型会话里真正生效。
+> - **真正拦住调用的是执行期 `guard`，不是 `restrict`。** 实测一个 `qq-chat-readonly` 会话的 `request/header.tools` 里躺着 86 个工具名（含 `bsk_*`、`mnemon_*`、`acp_*` 等插件工具），全都在 schema 里可见；它们只是每次调用被 `toolGuardReason()` 拒绝。代价是模型看得见、会去试、试了才失败 —— 想彻底不出现，得在 preset 层**不挂载**对应插件，而不是指望 `restrict`。
+> - 名单本身仍要维护：换成别的 composition（把工具推进全局层）时 `restrict` 就会生效，而且它是**唯一的注册期防线**。`scan:tool-names` 就是防止这份名单烂掉。它现在会**自动定位 `resources/app.asar`**（桌面版把整套 `@deepseek-ai/*` 打包在 asar 里，profile 的 `node_modules` 下一个 DSH 包都没有）；装到非默认盘又探测失败时，用 `DSH_ASAR=<安装目录>/resources/app.asar` 显式指路。抽不到名字时脚本**报错退出**，不再静默全绿。
+>
+> **2026-11-02 补记：注册期闸门已改成「先探测、再 allow 收敛」。** 以前是拿 82 个名字逐个 `restrict({deny:[name]})`，其中 77 个在典型会话里根本不存在于全局层（`read` / `pwsh` / `glob` 这类是 preset 自己注册的 scoped 工具），于是 77 次抛错被 try/catch 吞掉，日志只剩一行「跳过 77/82 个」，看着像已挡住、实际全空转。现在改成：先用一个不存在的名字探出 DSH 的**权威全局清单**（报错尾巴 `known global tools: …`），再把清单里所有非 `mcp__*`、非 `ask_user_question`/`todo_write` 的名字一次性 deny 掉。好处是**不需要知道名字就能封住**——DSH 新增啥全局工具也会自动进隐藏名单，日志会打 `restrict 全局层实测 N 个：隐藏 M 个、保留 K 个` + 名单外新增的危险名提示。仍挡不住的只有 scoped 工具那部分（见上一条），那要靠 preset 层「不挂载插件」解决。
+
+> **会话级工具开关的实际粒度（2026-11-02 补记，别指望它从 schema 里消失）**
+>
+> `socialV2.tools` 那 31 个开关（`sendVoice` / `sendSticker` / `getForwardMsg` …）是 **MCP 服务启动时**决定要不要 `server.tool(...)` 注册的，一个 MCP 进程只有一份工具表 ⇒ **进程级，不是会话级**。2026-11-02 起每个开关都支持按会话覆盖（`state/session-tools.json` + `POST /api/session-tool` + 控制台「会话级工具开关」），但覆盖只在**调用期**生效：本会话被关掉的工具**仍然出现在模型看到的 schema 里**，只是每次调用会被服务端以「工具 X 已被本会话关闭」拒掉。想让它彻底不出现在 schema，只能改全局 `config.json` 然后重启 MCP/桥接。这是 MCP 协议的进程模型决定的，不是本项目的取舍。
 
 ### 3. 出站内容（模型能说什么、能发什么）
 
@@ -150,11 +162,11 @@ DSH 的 Windows 文件沙箱按**能力 SID** 授权：SID 由 `sha256(规范化
 ## 四、发布前必须跑的检查（回归清单）
 
 ```bash
-npm run test:audit          # 30 个离线回归脚本（含安全专项），必须全绿
+npm run test:audit          # 57 个离线回归脚本（含安全专项），必须全绿；沙箱里会因 spawn EPERM 假失败，需在无沙箱终端跑
 npm run verify:adaptation   # DSH 适配一致性（preset/工具守卫/MCP 挂载/活 DSH 实测）
 npm run verify:persona      # 人格配置一致性
 npm run diagnose:acl        # ACL 收紧路径盘点（只读；需在**无沙箱**终端跑，见 §2.6）
-npm run scan:tool-names     # 守卫名单 vs 已安装 DSH 的真实工具名（每次升级 DSH 后跑）
+npm run scan:tool-names     # 守卫名单 vs 已安装 DSH 的真实工具名（每次升级 DSH 后跑；自动读 app.asar）
 node --check src/bridge.js  # 语法门禁（大文件改动后必跑）
 ```
 

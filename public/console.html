@@ -2601,6 +2601,47 @@ button:active:not(:disabled) {
         <span class="meta">保存后立即生效并写入 config.json</span>
       </div>
     </section>
+<section id="section-session-preset" data-page="access" class="card span-all">
+      <h2>会话级档位覆盖</h2>
+      <div class="meta" style="margin-bottom:10px">
+        默认情况下档位是按会话自动算的：管理员私聊 → 全工具；白名单内 → 只读；其余 → 仅聊天。
+        这里可以给<b>某一个会话</b>单独指定用哪个 preset，压过自动算出来的那个。改完这个会话会按新 preset 重建（上下文会重来）。
+      </div>
+      <div class="row">
+        <label style="flex:0 0 88px">会话</label>
+        <select id="spKey" style="flex:0 1 300px"><option value="">（选择会话）</option></select>
+        <button id="spRefresh" class="small">刷新</button>
+        <select id="spPreset" style="flex:0 1 200px"><option value="">（选择档位）</option></select>
+        <button id="spSet">指定</button>
+        <button id="spClear">移除覆盖</button>
+      </div>
+      <div class="meta" id="spMsg" style="margin-top:8px"></div>
+      <div id="spList" class="meta" style="margin-top:8px">还没有任何会话覆盖。</div>
+      <div class="meta" style="margin-top:10px">
+        可选档位只有四个 <code>qq-chat*</code>，<b>不接受任意 preset 名</b>——DSH 的默认 preset（standard）带 bash 与文件读写，一旦套到群聊会话上，群友就能驱动一个能操作本机的 agent。
+      </div>
+    </section>
+    <section id="section-session-tool" data-page="access" class="card span-all">
+      <h2>会话级工具开关</h2>
+      <div class="meta" style="margin-bottom:10px">
+        下面这些开关原本是<b>全局</b>的。这里可以给<b>某一个会话</b>单独翻转其中几个，压过全局设置。
+        <br><b>注意</b>：MCP 工具是一个进程一份工具表，会话级只能卡在<b>调用期</b> —— 关掉的工具仍然会出现在模型看到的工具清单里，只是它一调就会被拒（「工具未启用」）。要让它彻底消失，只能关全局开关（那会影响所有会话）。
+      </div>
+      <div class="row">
+        <label style="flex:0 0 88px">会话</label>
+        <select id="stKey" style="flex:0 1 300px"><option value="">（选择会话）</option></select>
+        <button id="stRefresh" class="small">刷新</button>
+        <select id="stFlag" style="flex:0 1 220px"><option value="">（选择工具开关）</option></select>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button id="stOn">本会话打开</button>
+        <button id="stOff">本会话关闭</button>
+        <button id="stClear">移除覆盖</button>
+        <span class="meta" id="stMsg"></span>
+      </div>
+      <div class="meta" style="margin-top:8px">全局当前值：<span id="stGlobal">-</span></div>
+      <div id="stList" class="meta" style="margin-top:8px">还没有任何会话覆盖。</div>
+    </section>
 <section id="section-silent" data-page="overview" class="card">
       <h2>静默开关</h2>
       <div class="row">
@@ -3628,6 +3669,158 @@ document.getElementById('dshEffortSave').addEventListener('click', async () => {
 });
 document.getElementById('silentOn').addEventListener('click', async () => { await api('/api/role-mode', 'POST', { mode: 'silent' }); refresh(); });
 document.getElementById('silentOff').addEventListener('click', async () => { await api('/api/role-mode', 'POST', { mode: 'active' }); refresh(); });
+// ── 会话级档位覆盖（/api/session-preset + /api/permission-tiers） ─────────────
+// 会话下拉复用白名单与已建会话两处来源；档位下拉直接用后端给的 choices，
+// 不在前端再抄一份可选值 —— 抄一份就有第二个真相，改清单时必漏。
+async function refreshSessionPresets() {
+  const sel = document.getElementById('spKey');
+  const prev = sel.value;
+  let data = null;
+  try { data = await api('/api/permission-tiers'); } catch {}
+  const rows = data?.sessions || [];
+  const seen = new Map();
+  for (const r of rows) seen.set(r.key, { tier: r.tier, preset: r.preset, override: r.override });
+  try {
+    const s = await api('/api/status');
+    for (const g of (s.allowGroups || [])) if (!seen.has(`group:${g}`)) seen.set(`group:${g}`, { tier: 'readonly', preset: '', override: null });
+    for (const p of (s.allowPrivate || [])) if (!seen.has(`private:${p}`)) seen.set(`private:${p}`, { tier: 'readonly', preset: '', override: null });
+  } catch {}
+  const opts = [...seen.entries()]
+    .map(([k, v]) => ({ value: k, label: `${k.startsWith('group:') ? '群' : '私聊'} ${k.split(':')[1]}（${v.tier}${v.override ? ' · 已覆盖' : ''}）` }))
+    .sort((a, b) => a.value.localeCompare(b.value));
+  sel.innerHTML = '<option value="">（选择会话）</option>' + opts.map((o) => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('');
+  if (prev && opts.some((o) => o.value === prev)) sel.value = prev;
+
+  const psel = document.getElementById('spPreset');
+  const prevPreset = psel.value;
+  const choices = Array.isArray(data?.choices) && data.choices.length ? data.choices : ['qq-chat', 'qq-chat-v2', 'qq-chat-readonly', 'qq-chat-owner'];
+  const installed = new Set(data?.dshPresets || []);
+  psel.innerHTML = '<option value="">（选择档位）</option>' + choices.map((c) => {
+    // 没装进 DSH 的档位标出来：选了也建不出会话（fail-closed），不如提前说清楚。
+    const missing = installed.size > 0 && !installed.has(c) ? '（未安装）' : '';
+    return `<option value="${esc(c)}">${esc(c)}${missing}</option>`;
+  }).join('');
+  if (prevPreset) psel.value = prevPreset;
+
+  const list = document.getElementById('spList');
+  const overridden = rows.filter((r) => r.override);
+  if (!overridden.length) {
+    list.textContent = '还没有任何会话覆盖。';
+  } else {
+    list.innerHTML = overridden.map((r) => {
+      const tier = r.tier || 'chat';
+      const changed = r.override !== r.preset ? '' : '';
+      return `<div>${esc(r.key)} → <code>${esc(r.override)}</code>（档位默认是 ${esc(tier)}）${changed}</div>`;
+    }).join('');
+  }
+}
+document.getElementById('spRefresh').addEventListener('click', refreshSessionPresets);
+document.getElementById('spKey').addEventListener('focus', () => {
+  if (document.getElementById('spKey').options.length <= 1) refreshSessionPresets();
+});
+async function sessionPresetSubmit(body) {
+  const key = document.getElementById('spKey').value;
+  if (!key) { alert('先选一个会话'); return; }
+  const r = await api('/api/session-preset', 'POST', { key, ...body });
+  const msg = document.getElementById('spMsg');
+  if (r.ok) {
+    msg.textContent = body.preset ? `已把 ${key} 指到 ${body.preset}，该会话会按新档位重建。` : `已移除 ${key} 的覆盖，回落到档位默认。`;
+    msg.className = 'meta ok';
+    refreshSessionPresets(); refresh();
+  } else {
+    msg.textContent = r.error || '设置失败';
+    msg.className = 'meta err';
+  }
+}
+document.getElementById('spSet').addEventListener('click', () => {
+  const preset = document.getElementById('spPreset').value;
+  if (!preset) { alert('先选一个档位'); return; }
+  sessionPresetSubmit({ preset });
+});
+document.getElementById('spClear').addEventListener('click', () => {
+  const key = document.getElementById('spKey').value;
+  if (!key) { alert('先选一个会话'); return; }
+  if (!confirm(`移除 ${key} 的档位覆盖？之后它会退回自动算出来的档位。`)) return;
+  sessionPresetSubmit({ preset: null, fallback: true });
+});
+// ── 会话级工具开关（/api/session-tool + /api/permission-tiers） ───────────────
+// 开关清单与全局值都来自后端 toolFlags，前端不抄第二份。
+let stFlagGlobal = new Map();
+async function refreshSessionTools() {
+  const sel = document.getElementById('stKey');
+  const prev = sel.value;
+  let data = null;
+  try { data = await api('/api/permission-tiers'); } catch {}
+  const rows = data?.sessions || [];
+  const seen = new Map();
+  for (const r of rows) seen.set(r.key, { tier: r.tier, toolOverrides: r.toolOverrides });
+  try {
+    const s = await api('/api/status');
+    for (const g of (s.allowGroups || [])) if (!seen.has(`group:${g}`)) seen.set(`group:${g}`, { tier: 'readonly', toolOverrides: null });
+    for (const p of (s.allowPrivate || [])) if (!seen.has(`private:${p}`)) seen.set(`private:${p}`, { tier: 'readonly', toolOverrides: null });
+  } catch {}
+  const opts = [...seen.entries()]
+    .map(([k, v]) => ({ value: k, label: `${k.startsWith('group:') ? '群' : '私聊'} ${k.split(':')[1]}（${v.tier}${v.toolOverrides ? ' · 有覆盖' : ''}）` }))
+    .sort((a, b) => a.value.localeCompare(b.value));
+  sel.innerHTML = '<option value="">（选择会话）</option>' + opts.map((o) => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join('');
+  if (prev && opts.some((o) => o.value === prev)) sel.value = prev;
+
+  const flags = Array.isArray(data?.toolFlags) ? data.toolFlags : [];
+  stFlagGlobal = new Map(flags.map((f) => [f.flag, f.global]));
+  const fsel = document.getElementById('stFlag');
+  const prevFlag = fsel.value;
+  fsel.innerHTML = '<option value="">（选择工具开关）</option>' + flags.map((f) =>
+    `<option value="${esc(f.flag)}">${esc(f.flag)}（全局${f.global ? '开' : '关'}）</option>`).join('');
+  if (prevFlag) fsel.value = prevFlag;
+
+  const list = document.getElementById('stList');
+  const bag = data?.sessionTools || {};
+  const keys = Object.keys(bag);
+  if (!keys.length) {
+    list.textContent = '还没有任何会话覆盖。';
+  } else {
+    list.innerHTML = keys.sort().map((k) => {
+      const pairs = Object.entries(bag[k]).map(([f, on]) => `${esc(f)}=${on ? '开' : '关'}`).join('、');
+      return `<div>${esc(k)} → ${pairs}</div>`;
+    }).join('');
+  }
+}
+function stSyncGlobal() {
+  const flag = document.getElementById('stFlag').value;
+  const el = document.getElementById('stGlobal');
+  if (!flag) { el.textContent = '-'; return; }
+  el.textContent = stFlagGlobal.has(flag) ? (stFlagGlobal.get(flag) ? '开' : '关') : '（未知）';
+}
+document.getElementById('stFlag').addEventListener('change', stSyncGlobal);
+document.getElementById('stRefresh').addEventListener('click', refreshSessionTools);
+document.getElementById('stKey').addEventListener('focus', () => {
+  if (document.getElementById('stKey').options.length <= 1) refreshSessionTools();
+});
+async function sessionToolSubmit(body) {
+  const key = document.getElementById('stKey').value;
+  if (!key) return alert('先选一个会话');
+  const flag = document.getElementById('stFlag').value;
+  if (!flag) return alert('先选一个工具开关');
+  const r = await api('/api/session-tool', 'POST', { key, flag, ...body });
+  const msg = document.getElementById('stMsg');
+  if (r.ok) {
+    msg.textContent = body.enabled === null ? `已移除 ${key} 对 ${flag} 的覆盖。` : `已把 ${key} 的 ${flag} 设为${body.enabled ? '开' : '关'}。`;
+    msg.className = 'meta ok';
+    refreshSessionTools();
+  } else {
+    msg.textContent = r.error || '设置失败';
+    msg.className = 'meta err';
+  }
+}
+document.getElementById('stOn').addEventListener('click', () => sessionToolSubmit({ enabled: true }));
+document.getElementById('stOff').addEventListener('click', () => sessionToolSubmit({ enabled: false }));
+document.getElementById('stClear').addEventListener('click', () => {
+  const key = document.getElementById('stKey').value;
+  const flag = document.getElementById('stFlag').value;
+  if (!key || !flag) return alert('先选会话和工具开关');
+  if (!confirm(`移除 ${key} 对 ${flag} 的覆盖？之后它跟着全局开关走。`)) return;
+  sessionToolSubmit({ enabled: null, fallback: true });
+});
 document.getElementById('wlSave').addEventListener('click', async () => {
   const parse = (s) => s.split(/[,，\s]+/).map(x => x.trim()).filter(Boolean).map(Number).filter(Number.isFinite);
   const r = await api('/api/whitelist', 'POST', {
@@ -5918,7 +6111,7 @@ document.getElementById('usageClear').addEventListener('click', async () => {
 
 setConsolePage(location.hash.slice(1), { updateHash:false });
 
-refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); loadV2LiveStates(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent(); loadSnapshots();
+refresh(); refreshRoles(); refreshWhitelist(); refreshSessions(); refreshPending(); refreshPresets(); loadSocialForm(); loadV2Config(); refreshV2Activity(); loadV2ToolLog(); loadV2SessionOptions(); loadV2LiveStates(); refreshSocialStatus(); refreshSlang(); loadSlangConfig(); loadSecurity(); refreshSimPrompt(); refreshDshModel(); refreshUsage(); refreshUsageChart(); refreshUsageRecent(); loadSnapshots(); refreshSessionPresets(); refreshSessionTools();
 // 轮询按页分流：statusText（顶栏连接徽章）和 pendingCount（导航栏"会话与审批"角标）
 // 是换到哪一页都看得见的全局指示，所以 refresh() 和 refreshPending() 照旧每 3 秒跑；
 // 其余三个只写某一页的元素，页面不可见时不必拉 —— refreshSlang 尤其亏，它每 3 秒

@@ -241,6 +241,28 @@ const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
   'dev_uninject_plugin',
 ]
 
+/**
+ * 「安装包里确实存在，但我们**故意**不放进 restrict 名单」的工具名。
+ *
+ * 为什么需要显式列出来（2026-11-01 对账时发现）：核对工具会把「DSH 里有、
+ * 守卫没挡」当成漏网报出来。这四个名字属于两种情况，都不该挡：
+ *
+ *   · `ask_user_question` / `todo_write` —— 模型侧无害工具，`SAFE_EXACT` 里
+ *     本来就要放行；挡了反而与白名单自相矛盾。
+ *   · `web_fetch` / `web_search` —— `dsh-tool-web` 提供的联网工具。仿真会话的
+ *     preset 里已经把 `tool-web` 的 `search: false` / `fetch: false` 关掉，
+ *     它们根本不注册；而 owner 档需要它们。所以「挡」的位置在 preset 层，
+ *     不在守卫层。
+ *
+ * 本数组只用于**对账脚本消歧**，不参与任何 restrict 调用。
+ */
+export const DESIGN_ALLOWED_TOOL_NAMES = Object.freeze([
+  'ask_user_question',
+  'todo_write',
+  'web_fetch',
+  'web_search',
+])
+
 // 供 test-preset-local-tools.mjs 导入并与 DSH 真实工具名对账，避免两份名单漂移。
 //
 // 去重是**必须**的，不是顺手：名单按来源分段拼装（本地执行面 / 宿主资源工具 / 可选包 /
@@ -386,6 +408,82 @@ function stripKnownTools(message) {
     .slice(0, 200)
 }
 
+/**
+ * 从 `tools.restrict()` 的报错里抠出**本进程真实的**全局工具名清单。
+ *
+ * 为什么值得抠（2026-11-02）：DSH 的报错尾巴是
+ *   `…; known global tools: acp_cache, acp_status, advanced_search, …`
+ * 这就是一份权威的、当前 composition 下真实注册的全局层工具表。以前我们把它
+ * 当成噪声剥掉（`stripKnownTools`），于是只知道"82 个里跳过了 77 个"，却不知道
+ * 那 77 个**本来就不存在**、也不知道全局层里还有哪些名字我们压根没挡。
+ *
+ * 注意 `(none)` 是 DSH 在全局层为空时的输出，必须当空集处理，不能当成一个名字。
+ * @param {unknown} message 任意一条 restrict 报错文本
+ * @returns {string[]|undefined} 名字数组；解析不到返回 undefined（调用方应退回旧行为）
+ */
+export function parseKnownGlobalTools(message) {
+  const text = String(message ?? '')
+  const match = /known global tools:([\s\S]*)$/i.exec(text)
+  if (!match) return undefined
+  const body = match[1].trim()
+  if (body === '' || /^\(none\)$/i.test(body)) return []
+  return body
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+}
+
+/**
+ * 判定一个工具名是否属于「守卫明确允许」的那一类（前缀白名单 + 两个无害模型侧工具）。
+ * @param {string} name 工具名
+ * @returns {boolean}
+ */
+function isAllowedByName(name) {
+  return SAFE_EXACT.has(name) || SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))
+}
+
+/**
+ * 探测本进程真实的全局工具表。
+ *
+ * 手法：故意 deny 一个必定不存在的名字，让 DSH 抛「unknown global tool」，再从报错
+ * 尾巴抠清单。副作用为零 —— 这个名字不存在，就算万一被接受也只是 deny 了一个空名。
+ * @param {(filter: {deny: string[]}) => unknown} restrict ctx.tools.restrict 绑定
+ * @returns {string[]|undefined}
+ */
+export function probeKnownGlobalTools(restrict) {
+  const sentinel = '__qq_bridge_probe__'
+  try {
+    restrict({ deny: [sentinel] })
+    // 万一 DSH 不校验未知名字（未来版本放宽），探测失效，退回旧行为。
+    return undefined
+  } catch (error) {
+    return parseKnownGlobalTools(error?.message ?? error)
+  }
+}
+
+/**
+ * 按「全量 allow」把全局层收敛到只留白名单那一类。
+ *
+ * 这是本守卫的核心修法（2026-11-02）：以前是 82 个名字逐个 deny —— 而其中 77 个
+ * 在当前 composition 下根本不存在，restrict 全部抛错跳过，等于什么都没藏；真正
+ * 在全局层的 `acp_*` / `bsk_*` / `mnemon_*` / `advanced_search` 等反而一个都没挡，
+ * 它们照样出现在会话 schema 里，模型反复尝试、反复被 guard 拒。
+ *
+ * 改成 allow 之后：全局层里凡是"守卫不认识"的名字一律从 schema 消失，
+ * 模型再也看不见它们（不是"看得见但调不动"）。
+ * @param {(filter: {allow?: string[], deny?: string[]}) => unknown} restrict
+ * @param {string[]} known 探测到的全局工具名
+ * @returns {{hidden: string[], kept: string[]}}
+ */
+export function restrictToAllowList(restrict, known) {
+  const kept = known.filter(isAllowedByName)
+  const hidden = known.filter((name) => !isAllowedByName(name))
+  if (hidden.length === 0) return { hidden: [], kept }
+  // 只 deny「确实存在且不该给的」；不碰白名单里的名字，避免把 MCP 工具一起关掉。
+  restrict({ deny: hidden })
+  return { hidden, kept }
+}
+
 function writeDiagnostics(lines) {
   if (!DIAG_FILE || !lines.length) return
   // 单行截断：DSH 的报错里会把**整份** known global tools 清单拼进去（实测单行 2KB+），
@@ -432,40 +530,75 @@ export function apply(ctx, config = {}) {
     return ok
   }
 
-  const firstOk = attempt(RESTRICTED_TOOL_NAMES)
-  const firstFailed = failed.slice()
-  failed.length = 0
-
-  if (firstFailed.length > 0) {
-    // DSH 的报错会把**整份** known global tools 清单内嵌进每条 message（实测单条 2KB+），
-    // 直接 join 会刷出几十 KB 噪声（0.2.1-rc.3 实测每次 26KB，把真日志全淹了）。
-    // 这里只保留「根因模式」：剥掉清单、把具体工具名归一，于是 N 条不同报错收敛成 1 类。
-    // 完整细节仍然落盘到 state/tool-restrict.log（writeDiagnostics 自带单行截断 + 20 行上限）。
-    const reasons = [...new Set(firstFailed.map((f) => stripKnownTools(f.message)))]
-    const skipped = firstFailed.map((f) => f.name)
-    console.error(
-      `[qq-tool-restrict] restrict 跳过 ${firstFailed.length}/${RESTRICTED_TOOL_NAMES.length} 个（该 DSH 版本未注册这些名字；执行期白名单仍然兜底）`
-    )
-    console.error(`  根因: ${reasons.slice(0, 2).join(' | ')}${reasons.length > 2 ? ` …(共 ${reasons.length} 类)` : ''}`)
-    console.error(`  样例: ${skipped.slice(0, 6).join(', ')}${skipped.length > 6 ? ` …(共 ${skipped.length} 个)` : ''}`)
-    writeDiagnostics([
-      `${stamp} restrict ok=${firstOk} skipped=${firstFailed.length} 原因: ${reasons.join(' | ')}`,
-      `${stamp} 跳过样例: ${skipped.slice(0, 12).join(', ')}`,
-    ])
-    // 时序兜底：注入器的工具可能在 preset apply 之后才注册进全局层。
-    // 3 秒后重试失败项；成功则记一行，失败保留原因。
-    const timer = setTimeout(() => {
-      let ok = 0
-      const still = []
-      for (const { name } of firstFailed) {
-        try { ctx.tools.restrict({ deny: [name] }); ok += 1 } catch (error) { still.push(`${name}: ${error?.message ?? error}`) }
+  // 1a) 先探测本进程真实的全局工具表（2026-11-02）。
+  //     有它就够了：知道哪些名字真的在，才能只 deny 该 deny 的；
+  //     探测不到（未来 DSH 放宽了 unknown 校验）就退回 1b 的逐个试。
+  const known = probeKnownGlobalTools((filter) => ctx.tools.restrict(filter))
+  if (known !== undefined) {
+    let hidden = []
+    let kept = []
+    try {
+      const result = restrictToAllowList((filter) => ctx.tools.restrict(filter), known)
+      hidden = result.hidden
+      kept = result.kept
+    } catch (error) {
+      // allow/deny 整批被拒（理论上不该发生，因为名字都来自 DSH 自己报的清单）。
+      console.error(`[qq-tool-restrict] 按 allow 收敛全局工具失败，退回逐个 deny：${error?.message ?? error}`)
+      const firstOk = attempt(RESTRICTED_TOOL_NAMES)
+      if (firstOk === 0) {
+        writeDiagnostics([`${stamp} restrict 探测到 ${known.length} 个全局工具但收敛失败：${stripKnownTools(error?.message ?? error)}`])
       }
-      if (ok > 0) console.error(`[qq-tool-restrict] 延迟重试补藏成功 ${ok} 个`)
+    }
+    if (hidden.length > 0) {
       writeDiagnostics([
-        `${new Date().toISOString()} 延迟重试 ok=${ok} 仍失败=${still.length}${still.length ? ` 原因: ${still[0]}` : ''}`,
+        `${stamp} restrict 全局层实测 ${known.length} 个：隐藏 ${hidden.length} 个、保留 ${kept.length} 个`,
+        `${stamp} 已隐藏: ${hidden.slice(0, 12).join(', ')}${hidden.length > 12 ? ` …(共 ${hidden.length} 个)` : ''}`,
       ])
-    }, 3000)
-    timer?.unref?.()
+    }
+    // 全局层里出现了名单没覆盖的危险语义名，说明名单该更新了 —— 但**不阻断**，
+    // allow 收敛已经把它们藏掉了。
+    const unknownDanger = hidden.filter((name) => !RESTRICTED_TOOL_NAMES.includes(name))
+    if (unknownDanger.length > 0) {
+      console.error(`[qq-tool-restrict] 提示：全局层有 ${unknownDanger.length} 个名字不在已知名单里（已被 allow 收敛隐藏）：${unknownDanger.slice(0, 6).join(', ')}`)
+    }
+  } else {
+    // 1b) 探测失败时的旧路径：逐个 deny。名单里当前 DSH 版本不存在的名字会单独
+    //     抛错并跳过，不会导致整批限制失败（restrict 的 unknown 校验是整批原子性的）。
+    const firstOk = attempt(RESTRICTED_TOOL_NAMES)
+    const firstFailed = failed.slice()
+    failed.length = 0
+
+    if (firstFailed.length > 0) {
+      // DSH 的报错会把**整份** known global tools 清单内嵌进每条 message（实测单条 2KB+），
+      // 直接 join 会刷出几十 KB 噪声（0.2.1-rc.3 实测每次 26KB，把真日志全淹了）。
+      // 这里只保留「根因模式」：剥掉清单、把具体工具名归一，于是 N 条不同报错收敛成 1 类。
+      // 完整细节仍然落盘到 state/tool-restrict.log（writeDiagnostics 自带单行截断 + 20 行上限）。
+      const reasons = [...new Set(firstFailed.map((f) => stripKnownTools(f.message)))]
+      const skipped = firstFailed.map((f) => f.name)
+      console.error(
+        `[qq-tool-restrict] restrict 跳过 ${firstFailed.length}/${RESTRICTED_TOOL_NAMES.length} 个（该 DSH 版本未注册这些名字；执行期白名单仍然兜底）`
+      )
+      console.error(`  根因: ${reasons.slice(0, 2).join(' | ')}${reasons.length > 2 ? ` …(共 ${reasons.length} 类)` : ''}`)
+      console.error(`  样例: ${skipped.slice(0, 6).join(', ')}${skipped.length > 6 ? ` …(共 ${skipped.length} 个)` : ''}`)
+      writeDiagnostics([
+        `${stamp} restrict ok=${firstOk} skipped=${firstFailed.length} 原因: ${reasons.join(' | ')}`,
+        `${stamp} 跳过样例: ${skipped.slice(0, 12).join(', ')}`,
+      ])
+      // 时序兜底：注入器的工具可能在 preset apply 之后才注册进全局层。
+      // 3 秒后重试失败项；成功则记一行，失败保留原因。
+      const timer = setTimeout(() => {
+        let ok = 0
+        const still = []
+        for (const { name } of firstFailed) {
+          try { ctx.tools.restrict({ deny: [name] }); ok += 1 } catch (error) { still.push(`${name}: ${error?.message ?? error}`) }
+        }
+        if (ok > 0) console.error(`[qq-tool-restrict] 延迟重试补藏成功 ${ok} 个`)
+        writeDiagnostics([
+          `${new Date().toISOString()} 延迟重试 ok=${ok} 仍失败=${still.length}${still.length ? ` 原因: ${still[0]}` : ''}`,
+        ])
+      }, 3000)
+      timer?.unref?.()
+    }
   }
 
   // 2) 执行期白名单：任何不在允许范围内的工具调用都会被拒绝。

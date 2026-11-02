@@ -65,10 +65,19 @@
 
 - `socialV2` 的 `wake` / `context` 段补深度合并 —— config.json 里写了这两段但缺新键时，新键原来会静默变成 `undefined`
 - 控制台：改模型（原来只能看）、配置快照与回滚、人格改动预览、会话实时视图、黑话注入预览、轮询按页分流、单会话静音
+- **会话级档位覆盖**：三档权限（管理员 / 只读 / 仅聊天）原来只能按「谁在说话」自动算，现在可以在控制台给**单个会话**单独指定用哪个 preset，压过自动算出来的那个。可选值写死四个 `qq-chat*`，**不接受任意 preset 名** —— DSH 默认的 `standard` 带 bash 与文件读写，允许手填等于一次手滑就把「能操作本机的 agent」交给群友。接口走控制台令牌那条路，AI 拿 agent token 撞会被 403 挡住。改档位要重建会话（DSH 的会话跑过一轮就锁死了），存在 `state/session-presets.json`，不跟会话状态混放。
+- **会话级工具开关**：`socialV2.tools` 那 31 个 MCP 工具开关现在能按会话覆盖（`state/session-tools.json` + `POST /api/session-tool`），全局开、对某个群单独关，或反过来。⚠ 但**只是调用期生效**：MCP 工具是服务进程启动时注册的，一个进程一份工具表，所以关掉的工具**仍然在模型看到的 schema 里**，只是每次调用被拒。要让它彻底消失只能改全局配置并重启。
+- **工具守卫改成按全局清单收敛**：以前拿 82 个名字逐个 `restrict`，其中 77 个在典型会话里根本不存在于全局层（`read`/`pwsh`/`glob` 是 preset 自己注册的 scoped 工具），77 次抛错被吞掉，日志只剩「跳过 77/82」，看着像挡住了其实全空转。现在先用一个假名字探出 DSH 报错尾巴里的**权威全局清单**，再把清单里非 `mcp__*` 的名字一次性隐藏 —— 不需要预先知道名字，DSH 新增全局工具也会自动被盖住。
+
+**工具名对账**
+
+- `npm run scan:tool-names` 原来在本机对不了账：它按 profile 的 `node_modules` 找 `@deepseek-ai/*`，而 DSH 本体打包在 `resources/app.asar` 里 —— 扫到 0 个包、0 个工具名，把 `read`/`pwsh`/`subagent` 这些真名字全判成假名，测试还有「扫不到就跳过」的兜底，所以 56 个测试全绿但那道断言从没跑过。
+- 新增 `scripts/asar-read.mjs`：直接解 Electron asar 头（headerSize 在 offset 12，dataStart = 16 + headerSize），按 `/node_modules/@deepseek-ai/dsh-*/` 判定这个 asar 是不是 DSH，不是就换下一个候选。候选按 `DSH_INSTALL_ROOT` → `resourcesPath` → `execPath` 同目录 → `%LOCALAPPDATA%\Programs` → `%ProgramFiles%` → 各固定盘根下两层依次探（装在 D 盘这种非默认位置也能找到）。
+- 现在本机抽到 **305 个包 / 60 个工具名**，对账退出码 0；`DSH_ASAR` 指到别的 asar（比如 bilibili 的）会明确报错而不是静默扫 0 个。抽不到就红，不再跳过。
 
 **测试**
 
-- `npm run test:audit` 从 38 条扩到 **57 条**，新增 19 个回归脚本。每条新用例都做过**回退验证** —— 把改动撤回去它必须真的红。
+- `npm run test:audit` 从 38 条扩到 **59 条**，新增 21 个回归脚本。每条新用例都做过**回退验证** —— 把改动撤回去它必须真的红。
 
 逐版说明见 [Releases](https://github.com/linsport/dsh-qq-bridge/releases) 与 git tag 的附注。
 
